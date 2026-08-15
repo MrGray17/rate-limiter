@@ -4,14 +4,21 @@ import assert from "node:assert/strict" ;
 
 
 test ("Alice should be accepted the first time" , () => {
-    const rL = new RateLimiter(() => Date.now());
+    const rL = new RateLimiter({
+                    windowSize : 10_000 ,
+                    requestLimit : 5 ,
+                    clock : () => Date.now()
+                });
 
     const output = rL.check("alice");
     assert.strictEqual (output , true);
 });
 
 test ("Only 5 req per window" , () => {
-    const rL = new RateLimiter(() => Date.now()) ;
+    const rL = new RateLimiter({
+                    windowSize : 10_000 ,
+                    requestLimit : 5 ,
+                    clock : () => Date.now()}) ;
 
     for (let i=0 ; i<5 ; i++) {
         const output = rL.check("alice")
@@ -23,7 +30,10 @@ test ("Only 5 req per window" , () => {
 
 test ("New windows accept requests" , () => {
     let fakeTime = 1000 ;
-    const rL = new RateLimiter(() => fakeTime)
+    const rL = new RateLimiter({
+                    windowSize : 10_000 ,
+                    requestLimit : 5 ,
+                    clock : () => fakeTime})
 
     for (let i = 0 ; i<5 ; i++) {
         const output = rL.check("alice") ;
@@ -38,7 +48,10 @@ test ("New windows accept requests" , () => {
 
 
 test("Users' limits should not interfere" , () => {
-    const rL = new RateLimiter(() => Date.now()) ;
+    const rL = new RateLimiter({
+                    windowSize : 10_000 ,
+                    requestLimit : 5 ,
+                    clock : () => Date.now()}) ;
 
     for (let i = 0 ; i < 5 ; i++) {
         const output = rL.check("alice") ;
@@ -47,4 +60,25 @@ test("Users' limits should not interfere" , () => {
     assert.strictEqual(rL.check("alice") , false);
 
     assert.strictEqual (rL.check ("bob") , true)
+});
+
+test ("New window and limit" , () => {
+    let fakeTime = 10_000 ;
+    const rL = new RateLimiter({
+        windowSize : 5000 ,
+        requestLimit : 2 ,
+        clock : () => fakeTime
+    }) ;
+
+    for (let i = 0 ; i < 2 ; i++) {
+        const output = rL.check("alice");
+        assert.strictEqual (output , true);
+    }
+    
+    fakeTime = 14_500 ;
+    assert.strictEqual (rL.check("alice") , false)
+
+    fakeTime = 16_000 ;
+    assert.strictEqual (rL.check("alice") , true)
+
 })

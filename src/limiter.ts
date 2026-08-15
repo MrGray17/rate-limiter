@@ -1,16 +1,27 @@
 type UserState = {
     count : number ,  // count means the number of requests already accepted, not incoming ones
     windowStart : number ,
+};
+
+type rateLimiterConfig = {           // we enforce the user to write manually parameters to avoid confusing number
+    windowSize : number ,
+    requestLimit : number ,
+    clock : () => number
 }
 
 export class RateLimiter {
+
     users : Map <string , UserState> ;
     clock : () => number;
-    windowSize = 10_000 ;
-    requestLimit = 5;
+    requestLimit : number ;
+    windowSize : number ;
 
-   constructor (clock : () => number) {
-    this.clock = clock ;
+   constructor ( rateLimiterConfig : rateLimiterConfig   ) {
+
+    this.clock = rateLimiterConfig.clock ;
+    this.requestLimit = rateLimiterConfig.requestLimit ;
+    this.windowSize = rateLimiterConfig.windowSize ;
+
     this.users = new Map <string , UserState> ()
    }
 
@@ -44,6 +55,3 @@ export class RateLimiter {
         }
    }
 }
-
-
-

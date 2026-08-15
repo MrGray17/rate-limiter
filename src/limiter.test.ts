@@ -1,0 +1,50 @@
+import {RateLimiter} from "./limiter.js";
+import test from "node:test";
+import assert from "node:assert/strict" ;
+
+
+test ("Alice should be accepted the first time" , () => {
+    const rL = new RateLimiter(() => Date.now());
+
+    const output = rL.check("alice");
+    assert.strictEqual (output , true);
+});
+
+test ("Only 5 req per window" , () => {
+    const rL = new RateLimiter(() => Date.now()) ;
+
+    for (let i=0 ; i<5 ; i++) {
+        const output = rL.check("alice")
+        assert.strictEqual (output , true)
+    }   
+    assert.strictEqual(rL.check("alice") , false)
+    
+});
+
+test ("New windows accept requests" , () => {
+    let fakeTime = 1000 ;
+    const rL = new RateLimiter(() => fakeTime)
+
+    for (let i = 0 ; i<5 ; i++) {
+        const output = rL.check("alice") ;
+        assert.strictEqual(output , true )
+    } 
+    assert.strictEqual (rL.check("alice") , false)
+
+    fakeTime = 12_000 ;
+    const output = rL.check("alice");
+    assert.strictEqual (output , true)
+})
+
+
+test("Users' limits should not interfere" , () => {
+    const rL = new RateLimiter(() => Date.now()) ;
+
+    for (let i = 0 ; i < 5 ; i++) {
+        const output = rL.check("alice") ;
+        assert.strictEqual (output , true)
+    }
+    assert.strictEqual(rL.check("alice") , false);
+
+    assert.strictEqual (rL.check ("bob") , true)
+})

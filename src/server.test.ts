@@ -1,28 +1,14 @@
-import { server } from "./server.js";
+import { createMyServer } from "./server.js";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { startServer, closeServer } from "./test-utils.js";
 
 test("allows first 5 requests and rejects the 6th", async () => {
-  const startServer = () => {
-    return new Promise<void>((resolve) => {
-      server.listen(0, () => {
-        resolve();
-      });
-    });
-  };
-
-  const closeServer = () => {
-    return new Promise<void>((resolve) => {
-      server.close(() => {
-        resolve();
-      });
-    });
-  };
-
-  await startServer();
+  const server1 = createMyServer();
+  await startServer(server1);
 
   try {
-    const address = server.address();
+    const address = server1.address();
     if (!address || typeof address === "string") {
       throw new Error("Server did not start correctly");
     }
@@ -44,6 +30,22 @@ test("allows first 5 requests and rejects the 6th", async () => {
     });
     assert.strictEqual(resp.status, 429);
   } finally {
-    await closeServer();
+    await closeServer(server1);
+  }
+});
+
+test("Missing x-client-id retuns 400", async () => {
+  const server2 = createMyServer();
+  await startServer(server2);
+  try {
+    const address = server2.address();
+    if (!address || typeof address === "string") {
+      throw new Error("Server did not start correctly");
+    }
+    const url = "http://localhost:" + address.port + "/hello";
+    const response = await fetch(url);
+    assert.strictEqual(response.status, 400);
+  } finally {
+    await closeServer(server2);
   }
 });

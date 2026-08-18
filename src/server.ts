@@ -12,8 +12,13 @@ export const createMyServer = () => {
     request: IncomingMessage,
     response: ServerResponse,
   ) => {
-    if (request.url == "/hello") {
-      //we are protection the /hello path
+    if (request.url == "/check") {
+      //we are protection the /check path
+
+      if (request.method != "POST"){ response.statusCode = 405
+        response.end("Method Not Allowed")
+        return;
+       }
       const clientId = request.headers["x-client-id"];
 
       if (clientId == undefined) {
@@ -36,9 +41,11 @@ export const createMyServer = () => {
         return;
       }
 
-      console.log(request.headers["x-client-id"]);
       response.end("hello");
-    } else if (request.url == "/status") {
+    } else if (request.url == "/health") {
+      if (request.method != "GET") {response.statusCode = 405
+        response.end("Method Not Allowed")
+          return}
       response.end("Server is running ...");
     } else {
       response.statusCode = 404;
@@ -47,5 +54,3 @@ export const createMyServer = () => {
   };
   return http.createServer(HANDLER_FUNCTION);
 };
-
-createMyServer();

@@ -12,13 +12,14 @@ test("allows first 5 requests and rejects the 6th", async () => {
     if (!address || typeof address === "string") {
       throw new Error("Server did not start correctly");
     }
-    const url = "http://localhost:" + address.port + "/hello";
+    const url = "http://localhost:" + address.port + "/check";
 
     for (let i = 0; i < 5; i++) {
       const response = await fetch(url, {
         headers: {
           "x-client-id": "Alice",
         },
+        method: "POST",
       });
       assert.strictEqual(response.status, 200);
     }
@@ -27,6 +28,7 @@ test("allows first 5 requests and rejects the 6th", async () => {
       headers: {
         "x-client-id": "Alice",
       },
+      method: "POST",
     });
     assert.strictEqual(resp.status, 429);
   } finally {
@@ -42,10 +44,29 @@ test("Missing x-client-id retuns 400", async () => {
     if (!address || typeof address === "string") {
       throw new Error("Server did not start correctly");
     }
-    const url = "http://localhost:" + address.port + "/hello";
-    const response = await fetch(url);
+    const url = "http://localhost:" + address.port + "/check";
+    const response = await fetch(url, {
+      method: "POST",
+    });
     assert.strictEqual(response.status, 400);
   } finally {
     await closeServer(server2);
+  }
+});
+
+test("405 if the method is get", async () => {
+  const server3 = createMyServer();
+  await startServer(server3);
+
+  const address = server3.address();
+  try {
+    if (!address || typeof address === "string") {
+      throw new Error("Server did not start correctly");
+    }
+    const url = "http://localhost:" + address.port + "/check";
+    const response = await fetch(url);
+    assert.strictEqual(response.status, 405);
+  } finally {
+    await closeServer(server3);
   }
 });

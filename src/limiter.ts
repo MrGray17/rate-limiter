@@ -10,8 +10,8 @@ type rateLimiterConfig = {
   clock: () => number;
 };
 
-export class RateLimiter {
-  users: Map<string, UserState>;
+export class RateLimiter {        //count and windowSize are user prop 
+  users: Map<string, UserState>;  // not limiter prop
   clock: () => number;
   requestLimit: number;
   windowSize: number;
@@ -27,7 +27,7 @@ export class RateLimiter {
   isAllowed(userId: string): boolean {
     const currentClock = this.clock(); // calling this.clock() several times may return different numbers
 
-    const state = this.users.get(userId);
+    const state = this.users.get(userId); //returns a userState obj
 
     if (state == undefined) {
       this.users.set(userId, { count: 1, windowStart: currentClock });

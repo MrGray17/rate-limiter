@@ -2,9 +2,16 @@ import { createMyServer } from "./server.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { startServer, closeServer } from "./test-utils.js";
+import { RateLimiter } from "./limiter.js";
+import { slidingWindow } from "./sliding-window-log.js";
 
 const BoringServerManagement = async (path: string) => {
-  const serverP = createMyServer();
+  const FixedWindow = new RateLimiter ({
+    windowSize : 10_000 ,
+    requestLimit : 5 ,
+    clock: () => Date.now()
+  })
+  const serverP = createMyServer(FixedWindow);
   await startServer(serverP);
 
   const address = serverP.address();

@@ -1,10 +1,10 @@
 type UserState = {
-  previousBucket: number;
-  currentBucket: number;
-  currentWindowStart: number;   //like buketstart but only in windows where alice requeested
+  previousBucketCount: number;
+  currentBucketCount: number;
+  currentBucketStart: number;
 };
 
-type UserConfig = {
+type SlidingWindowCounterConfig = {
   windowSize: number;
   requestLimit: number;
   clock: () => number;
@@ -16,7 +16,7 @@ export class SlidingWindowCounter {
   clock: () => number;
   users: Map<string, UserState>;
 
-  constructor(config: UserConfig) {
+  constructor(config: SlidingWindowCounterConfig) {
     this.windowSize = config.windowSize;
     this.requestLimit = config.requestLimit;
     this.clock = config.clock;
@@ -31,53 +31,45 @@ export class SlidingWindowCounter {
 
     const state = this.users.get(userId);
 
-    // First request from this user
     if (state === undefined) {
       this.users.set(userId, {
-        previousBucket: 0,
-        currentBucket: 1,
-        currentWindowStart: bucketStart,
+        previousBucketCount: 0,
+        currentBucketCount: 1,
+        currentBucketStart: bucketStart,
       });
 
       return true;
     }
 
-    // How many complete buckets have passed since
-    // the bucket stored in the user's state?
     const bucketsPassed =
-      (bucketStart - state.currentWindowStart) / this.windowSize;
+      (bucketStart - state.currentBucketStart) / this.windowSize;
 
     if (bucketsPassed >= 1) {
       if (bucketsPassed === 1) {
-        // The old current bucket becomes the previous bucket
-        state.previousBucket = state.currentBucket;
+        state.previousBucketCount = state.currentBucketCount;
       } else {
-        // We skipped at least one whole bucket,
-        // so the old requests are no longer relevant
-        state.previousBucket = 0;
+        state.previousBucketCount = 0;
       }
 
-      state.currentBucket = 0;
-      state.currentWindowStart = bucketStart;
+      state.currentBucketCount = 0;
+      state.currentBucketStart = bucketStart;
     }
 
-    // How far are we into the current bucket?
-    const elapsed = currentClock - state.currentWindowStart;
+    const elapsed = currentClock - state.currentBucketStart;
 
-    // What fraction of the previous bucket still overlaps
-    // the rolling window?
     const previousBucketWeight =
       (this.windowSize - elapsed) / this.windowSize;
 
     const estimatedRequests =
-      state.currentBucket +
-      state.previousBucket * previousBucketWeight + 1;
+      state.currentBucketCount +
+      state.previousBucketCount * previousBucketWeight +
+      1;
 
     if (estimatedRequests >= this.requestLimit) {
       return false;
     }
 
-    state.currentBucket++;
+    state.currentBucketCount++;
 
     return true;
   }

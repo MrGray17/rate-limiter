@@ -2,33 +2,35 @@ import { createMyServer } from "./server.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { startServer, closeServer } from "./test-utils.js";
-import { RateLimiter } from "./limiter.js";
-import { slidingWindow } from "./sliding-window-log.js";
+import { FixedWindow } from "./fixed-window.js";
 
-const BoringServerManagement = async (path: string) => {
-  const FixedWindow = new RateLimiter ({
-    windowSize : 10_000 ,
-    requestLimit : 5 ,
-    clock: () => Date.now()
-  })
-  const serverP = createMyServer(FixedWindow);
-  await startServer(serverP);
+const setupTestServer = async (path: string) => {
+  const fixedWindow = new FixedWindow({
+    windowSize: 10_000,
+    requestLimit: 5,
+    clock: () => Date.now(),
+  });
 
-  const address = serverP.address();
+  const server = createMyServer(fixedWindow);
+  await startServer(server);
+
+  const address = server.address();
+
   try {
     if (!address || typeof address === "string") {
       throw new Error("Server did not start correctly");
     }
+
     const url = "http://localhost:" + address.port + path;
-    return { url, serverP };
+    return { url, server };
   } catch (error) {
-    await closeServer(serverP);
+    await closeServer(server);
     throw error;
   }
 };
 
 test("allows first 5 requests and rejects the 6th", async () => {
-  const setup = await BoringServerManagement("/check");
+  const setup = await setupTestServer("/check");
 
   try {
     for (let i = 0; i < 5; i++) {
@@ -41,57 +43,60 @@ test("allows first 5 requests and rejects the 6th", async () => {
       assert.strictEqual(response.status, 200);
     }
 
-    const resp = await fetch(setup.url, {
+    const response = await fetch(setup.url, {
       headers: {
         "x-client-id": "Alice",
       },
       method: "POST",
     });
-    assert.strictEqual(resp.status, 429);
+    assert.strictEqual(response.status, 429);
   } finally {
-    await closeServer(setup.serverP);
+    await closeServer(setup.server);
   }
 });
 
-test("Missing x-client-id retuns 400", async () => {
-  const setup = await BoringServerManagement("/check");
+test("Missing x-client-id returns 400", async () => {
+  const setup = await setupTestServer("/check");
+
   try {
     const response = await fetch(setup.url, {
       method: "POST",
     });
     assert.strictEqual(response.status, 400);
   } finally {
-    await closeServer(setup.serverP);
+    await closeServer(setup.server);
   }
 });
 
 test("405 if the method is GET", async () => {
-  const setup = await BoringServerManagement("/check");
+  const setup = await setupTestServer("/check");
+
   try {
     const response = await fetch(setup.url, { method: "GET" });
     assert.strictEqual(response.status, 405);
   } finally {
-    await closeServer(setup.serverP);
+    await closeServer(setup.server);
   }
 });
 
 test("A GET /health should return 200", async () => {
-  const setup = await BoringServerManagement("/health");
+  const setup = await setupTestServer("/health");
 
   try {
     const response = await fetch(setup.url, { method: "GET" });
     assert.strictEqual(response.status, 200);
   } finally {
-    await closeServer(setup.serverP);
+    await closeServer(setup.server);
   }
 });
 
 test("Wrong path returns 404", async () => {
-  const setup = BoringServerManagement("/banana");
+  const setup = await setupTestServer("/banana");
+
   try {
-    const response = await fetch((await setup).url);
+    const response = await fetch(setup.url);
     assert.strictEqual(response.status, 404);
   } finally {
-    await closeServer((await setup).serverP);
+    await closeServer(setup.server);
   }
 });

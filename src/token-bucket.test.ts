@@ -1,82 +1,77 @@
 import test from "node:test";
 import assert from "node:assert";
-import { TokenBucket } from "./token-bucket.js";
+import { tockenBucket } from "./tocken-bucket.js";
 
 test("Burst capacity", () => {
   const fakeTime = 0;
-  const tokenBucket = new TokenBucket({
-    capacity: 5,
-    tokensPerTimeUnit: 1,
+  const tb = new tockenBucket({
+    bucketLimit: 5,
+    tockensPerTimeUnit: 1,
     timeUnit: 1000,
     clock: () => fakeTime,
   });
-
   for (let i = 0; i < 4; i++) {
-    tokenBucket.isAllowed("alice");
+    tb.isAllowed("alice");
   }
-
-  assert.strictEqual(tokenBucket.isAllowed("alice"), true);
-  assert.strictEqual(tokenBucket.isAllowed("alice"), false);
+  assert.strictEqual(tb.isAllowed("alice"), true);
+  assert.strictEqual(tb.isAllowed("alice"), false);
 });
 
 test("Refill", () => {
   let fakeTime = 0;
-  const tokenBucket = new TokenBucket({
-    capacity: 5,
-    tokensPerTimeUnit: 1,
+  const tb = new tockenBucket({
+    bucketLimit: 5,
+    tockensPerTimeUnit: 1,
     timeUnit: 1000,
     clock: () => fakeTime,
   });
 
   for (let i = 0; i < 5; i++) {
-    tokenBucket.isAllowed("alice");
+    tb.isAllowed("alice");
   }
-
-  assert.strictEqual(tokenBucket.isAllowed("alice"), false);
+  assert.strictEqual(tb.isAllowed("alice"), false);
   fakeTime = 1000;
-  assert.strictEqual(tokenBucket.isAllowed("alice"), true);
+  assert.strictEqual(tb.isAllowed("alice"), true);
 });
 
-test("Partial refill", () => {
+test("Partial Refill", () => {
   let fakeTime = 0;
-  const tokenBucket = new TokenBucket({
-    capacity: 5,
-    tokensPerTimeUnit: 1,
+  const tb = new tockenBucket({
+    bucketLimit: 5,
+    tockensPerTimeUnit: 1,
     timeUnit: 1000,
     clock: () => fakeTime,
   });
 
   for (let i = 0; i < 5; i++) {
-    tokenBucket.isAllowed("alice");
+    tb.isAllowed("alice");
   }
-
-  assert.strictEqual(tokenBucket.isAllowed("alice"), false);
+  assert.strictEqual(tb.isAllowed("alice"), false);
   fakeTime = 500;
-  assert.strictEqual(tokenBucket.isAllowed("alice"), false);
+  assert.strictEqual(tb.isAllowed("alice"), false);
   fakeTime = 1000;
-  assert.strictEqual(tokenBucket.isAllowed("alice"), true);
+  assert.strictEqual(tb.isAllowed("alice"), true);
 });
 
 test("Capacity ceiling", () => {
   let fakeTime = 0;
-  const tokenBucket = new TokenBucket({
-    capacity: 5,
-    tokensPerTimeUnit: 1,
+  const tb = new tockenBucket({
+    bucketLimit: 5,
+    tockensPerTimeUnit: 1,
     timeUnit: 1000,
     clock: () => fakeTime,
   });
 
   for (let i = 0; i < 5; i++) {
-    tokenBucket.isAllowed("alice");
+    tb.isAllowed("alice");
   }
 
   fakeTime = 500_000;
 
   for (let i = 0; i < 5; i++) {
-    tokenBucket.isAllowed("alice");
+    tb.isAllowed("alice");
   }
-
-  assert.strictEqual(tokenBucket.isAllowed("alice"), false);
+  assert.strictEqual(tb.isAllowed("alice"), false);
   fakeTime = 501_000;
-  assert.strictEqual(tokenBucket.isAllowed("alice"), true);
+  assert.strictEqual(tb.isAllowed("alice"), true);
 });

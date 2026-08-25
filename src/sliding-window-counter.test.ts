@@ -3,91 +3,97 @@ import test from "node:test";
 import assert from "node:assert";
 
 test("New user returns true", () => {
-  const slidingWindowCounter = new SlidingWindowCounter({
+  const swc = new SlidingWindowCounter({
     windowSize: 10_000,
     requestLimit: 5,
     clock: () => Date.now(),
   });
 
-  const output = slidingWindowCounter.isAllowed("Alice");
+  const output = swc.isAllowed("Alice");
   assert.strictEqual(output, true);
 });
 
-test("Request is rejected when estimated count reaches the limit", () => {
-  let fakeTime = 0;
-  const slidingWindowCounter = new SlidingWindowCounter({
+test("req not accepted if not under limit of prediction+current", () => {
+  const swc = new SlidingWindowCounter({
     windowSize: 10_000,
     requestLimit: 5,
     clock: () => fakeTime,
   });
-
+  let fakeTime = 0;
   for (let i = 0; i < 5; i++) {
-    slidingWindowCounter.isAllowed("alice");
+    swc.isAllowed("alice");  //the contribution here is 1.5 -- (0.3 x 5)
   }
 
   fakeTime = 17_000;
 
-  for (let i = 0; i < 4; i++) {
-    slidingWindowCounter.isAllowed("alice");
+  for (let i = 0; i < 3; i++) {
+    assert.strictEqual(swc.isAllowed("alice"), true);
   }
-
-  assert.strictEqual(slidingWindowCounter.isAllowed("alice"), false);
+  assert.strictEqual(swc.isAllowed("alice"), false);
 });
 
-test("Skipping more than one bucket resets old count", () => {
-  let fakeTime = 0;
-  const slidingWindowCounter = new SlidingWindowCounter({
+test("skipping more than a bucket resets count", () => {
+  const swc = new SlidingWindowCounter({
     windowSize: 10_000,
     requestLimit: 5,
     clock: () => fakeTime,
   });
 
+  let fakeTime = 0;
   for (let i = 0; i < 5; i++) {
-    slidingWindowCounter.isAllowed("alice");
+    swc.isAllowed("alice");
   }
 
-  fakeTime = 2 * 10_000;
+  fakeTime = 0 + 2 * 10_000;
 
   for (let i = 0; i < 3; i++) {
-    slidingWindowCounter.isAllowed("alice");
+    swc.isAllowed("alice");
   }
-
-  const output = slidingWindowCounter.isAllowed("alice");
+  const output = swc.isAllowed("alice");
   assert.strictEqual(output, true);
 });
 
-test("Limits are enforced inside the same bucket", () => {
-  let fakeTime = 0;
-  const slidingWindowCounter = new SlidingWindowCounter({
+test("Limits are enforced inside same bucket", () => {
+  const swc = new SlidingWindowCounter({
     windowSize: 10_000,
     requestLimit: 5,
     clock: () => fakeTime,
   });
 
+  let fakeTime = 0;
   for (let i = 0; i < 5; i++) {
-    slidingWindowCounter.isAllowed("alice");
+    swc.isAllowed("alice");
   }
-
-  assert.strictEqual(slidingWindowCounter.isAllowed("alice"), false);
+  assert.strictEqual(swc.isAllowed("alice"), false);
 });
 
-test("Crossing one bucket uses the previous bucket contribution", () => {
-  let fakeTime = 0;
-  const slidingWindowCounter = new SlidingWindowCounter({
+test("Crossing one bucket", () => {
+  const swc = new SlidingWindowCounter({
     windowSize: 10_000,
     requestLimit: 5,
     clock: () => fakeTime,
   });
-
+  let fakeTime = 0;
   for (let i = 0; i < 4; i++) {
-    slidingWindowCounter.isAllowed("alice");
+    swc.isAllowed("alice");
   }
-
   fakeTime = 11_000;
-
-  const first = slidingWindowCounter.isAllowed("alice");
+  //the weight contribution should be added : (4 x 9) / 10 = 3.6
+  //current bucket can only receive 1 req
+  const first = swc.isAllowed("alice");
   assert.strictEqual(first, true);
-
-  const second = slidingWindowCounter.isAllowed("alice");
+  const second = swc.isAllowed("alice");
   assert.strictEqual(second, false);
+});
+
+test("Bug hunt", () => {
+  const swc = new SlidingWindowCounter({
+    windowSize: 10_000,
+    requestLimit: 5,
+    clock: () => Date.now(),
+  });
+  for (let i = 0; i < 5; i++) {
+    assert.strictEqual(swc.isAllowed("alice"), true);
+  }
+  assert.strictEqual(swc.isAllowed("alice"), false);
 });

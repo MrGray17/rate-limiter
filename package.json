@@ -1,10 +1,12 @@
 {
   "name": "rate-limiter",
   "version": "1.0.0",
-  "description": "",
+  "description": "TypeScript rate limiter with multiple algorithms and HTTP integration",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "tsx src/start.ts",
+    "test": "tsx --test src/*.test.ts",
+    "typecheck": "tsc --noEmit"
   },
   "keywords": [],
   "author": "",

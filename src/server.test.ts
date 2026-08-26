@@ -1,17 +1,18 @@
-import { createMyServer } from "./server.js";
+import { createMyServer, type Limiter } from "./server.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { startServer, closeServer } from "./test-utils.js";
-import { FixedWindow } from "./fixed-window.js";
 
-const setupTestServer = async (path: string) => {
-  const fixedWindow = new FixedWindow({
-    windowSize: 10_000,
-    requestLimit: 5,
-    clock: () => Date.now(),
-  });
+const allowLimiter: Limiter = {
+  isAllowed: () => true,
+};
 
-  const server = createMyServer(fixedWindow);
+const rejectLimiter: Limiter = {
+  isAllowed: () => false,
+};
+
+const setupTestServer = async (path: string, limiter: Limiter = allowLimiter) => {
+  const server = createMyServer(limiter);
   await startServer(server);
 
   const address = server.address();
@@ -29,26 +30,34 @@ const setupTestServer = async (path: string) => {
   }
 };
 
-test("allows first 5 requests and rejects the 6th", async () => {
-  const setup = await setupTestServer("/check");
+test("returns 200 when limiter allows the request", async () => {
+  const setup = await setupTestServer("/check", allowLimiter);
 
   try {
-    for (let i = 0; i < 5; i++) {
-      const response = await fetch(setup.url, {
-        headers: {
-          "x-client-id": "Alice",
-        },
-        method: "POST",
-      });
-      assert.strictEqual(response.status, 200);
-    }
-
     const response = await fetch(setup.url, {
       headers: {
         "x-client-id": "Alice",
       },
       method: "POST",
     });
+
+    assert.strictEqual(response.status, 200);
+  } finally {
+    await closeServer(setup.server);
+  }
+});
+
+test("returns 429 when limiter rejects the request", async () => {
+  const setup = await setupTestServer("/check", rejectLimiter);
+
+  try {
+    const response = await fetch(setup.url, {
+      headers: {
+        "x-client-id": "Alice",
+      },
+      method: "POST",
+    });
+
     assert.strictEqual(response.status, 429);
   } finally {
     await closeServer(setup.server);

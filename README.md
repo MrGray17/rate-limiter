@@ -1,23 +1,26 @@
 # Rate Limiter
 
-A TypeScript rate-limiting service built from first principles to explore **rate-limiting algorithms, HTTP boundaries, deterministic testing, and eventually distributed correctness**.
+A TypeScript rate-limiting service built from first principles to explore **rate-limiting algorithms, HTTP boundaries, deterministic testing, performance trade-offs, and eventually distributed correctness**.
 
-The project is intentionally being developed in stages. The current implementation is a **single-process, in-memory fixed-window limiter** exposed through a small Node.js HTTP API. Distributed state, additional algorithms, benchmarks, and production hardening are part of the roadmap—not features being claimed today.
+The current version is a **single-process, in-memory implementation** with four interchangeable algorithms behind the same HTTP server contract. Benchmarking is the next major phase; Redis-backed distributed state and production hardening come afterward.
 
 ## Current capabilities
 
-- Per-client fixed-window rate limiting
-- Configurable request limit and window size
-- Injectable clock for deterministic time-based tests
-- Independent state per client using `Map`
+- Four rate-limiting algorithms:
+  - Fixed Window
+  - Sliding Window Log
+  - Sliding Window Counter
+  - Token Bucket
+- Per-client in-memory state using `Map`
+- Injectable clocks for deterministic time-based tests
+- A shared `Limiter` contract: `isAllowed(userId: string): boolean`
+- Dependency injection so the HTTP server is independent of the concrete algorithm
 - Small HTTP API:
-  - `POST /check` — consume/check quota for a client
+  - `POST /check` — check and consume quota
   - `GET /health` — health check
 - HTTP behavior for `200`, `400`, `404`, `405`, and `429`
-- Fresh server + limiter state per test through a server factory
-- Unit tests for limiter behavior
-- Integration tests using real HTTP requests
-- Clean async server startup and shutdown in tests
+- Behavioral tests for each algorithm
+- HTTP integration tests using fake limiter decisions rather than re-testing an algorithm
 
 ## Architecture
 
@@ -31,67 +34,52 @@ Node HTTP Server
   |-- route + method validation
   |-- read X-Client-Id
   v
-RateLimiter
+Limiter interface
   |
-  |-- lookup client state
-  |-- check window expiry
-  |-- check request count
-  |-- update state if allowed
-  v
-In-memory Map
-  |
-  v
-ALLOW / REJECT
-  |
-  v
-HTTP response
+  +--> FixedWindow
+  +--> SlidingWindowLog
+  +--> SlidingWindowCounter
+  +--> TokenBucket
+           |
+           v
+      in-memory state
+           |
+           v
+      ALLOW / REJECT
+           |
+           v
+      HTTP response
 ```
 
-Each server created by `createMyServer()` gets its own limiter instance and therefore its own in-memory state:
+`createMyServer()` receives a limiter from the outside. The HTTP layer only knows that the dependency has:
 
-```text
-Server A -> RateLimiter A -> Map A
-Server B -> RateLimiter B -> Map B
+```ts
+isAllowed(userId: string): boolean
 ```
 
-That isolation is useful for tests, but it also exposes the main limitation of the current version: **multiple application instances do not yet share rate-limit state**.
+That keeps algorithm behavior separate from HTTP behavior and makes both layers easier to test independently.
 
-## Fixed-window behavior
+## Algorithms
 
-For each client, the limiter stores:
+### Fixed Window
 
-```text
-count
-windowStart
-```
+Stores a request count and window start per client. It is simple and cheap, but traffic can burst around window boundaries.
 
-A request follows this decision path:
+### Sliding Window Log
 
-```text
-client unseen?
-  -> create state with count = 1
-  -> allow
+Stores the exact timestamps of requests still inside the rolling window. It closely matches a true rolling-window policy, but uses more memory and performs timestamp cleanup.
 
-existing client?
-  -> calculate elapsed time
+### Sliding Window Counter
 
-window expired?
-  -> start a new window at the current request
-  -> count = 1
-  -> allow
+Stores counts for the current and previous aligned buckets, then weights the previous bucket according to how much still overlaps the rolling window. It trades some accuracy for much smaller state than the log approach.
 
-window still active?
-  -> count >= limit -> reject
-  -> otherwise increment count and allow
-```
+### Token Bucket
 
-The current windows are **per-client and request-anchored** rather than globally aligned to clock boundaries.
+Stores tokens that refill over time. Accepted requests consume one token. This naturally supports short bursts while enforcing a sustained refill rate.
 
 ## API
 
 ### `POST /check`
-
-Checks whether the client may consume another request from its current quota.
 
 The current development identity mechanism is the `X-Client-Id` header:
 
@@ -100,8 +88,6 @@ POST /check HTTP/1.1
 X-Client-Id: alice
 ```
 
-Responses:
-
 | Status | Meaning |
 |---|---|
 | `200` | Request allowed |
@@ -109,19 +95,15 @@ Responses:
 | `405` | Wrong HTTP method |
 | `429` | Rate limit exceeded |
 
-> `X-Client-Id` is intentionally a temporary development mechanism. It is not authentication and can be spoofed by a client.
+`X-Client-Id` is intentionally a development mechanism. It is not authentication and can be spoofed by a client.
 
 ### `GET /health`
 
 Returns `200` while the HTTP service is running.
 
-```http
-GET /health HTTP/1.1
-```
-
 ## Running locally
 
-### Requirements
+Requirements:
 
 - Node.js
 - npm
@@ -135,10 +117,10 @@ npm install
 Start the server:
 
 ```bash
-npx tsx src/start.ts
+npm start
 ```
 
-The development server listens on port `3000`.
+The development server listens on port `3000`. `src/start.ts` currently selects `TokenBucket` as the active implementation; changing `activeLimiter` swaps the algorithm without changing the HTTP server.
 
 Check health:
 
@@ -152,79 +134,83 @@ Send a rate-limited request:
 curl -i -X POST -H "X-Client-Id: alice" http://localhost:3000/check
 ```
 
-With the current default configuration, the first five requests from the same client within a window are accepted and the sixth is rejected with `429 Too Many Requests`.
-
 ## Tests
 
-Run the limiter unit tests:
+Run the entire test suite:
 
 ```bash
-npx tsx src/limiter.test.ts
+npm test
 ```
 
-Run the HTTP integration tests:
+Type-check the project:
 
 ```bash
-npx tsx src/server.test.ts
+npm run typecheck
 ```
 
-The current tests cover:
+The behavioral tests cover algorithm-specific boundaries such as:
 
-- first request acceptance
-- request-limit enforcement
-- deterministic window expiry using a fake clock
-- isolation between client counters
-- custom limiter configuration
-- `POST /check` allowing the first five requests and rejecting the sixth
-- missing `X-Client-Id` returning `400`
-- incorrect method returning `405`
-- `GET /health` returning `200`
-- unknown paths returning `404`
+- exact request-limit enforcement
+- window expiration
+- rolling-window behavior
+- independent client state
+- weighted previous-bucket contribution
+- skipped-bucket cleanup
+- token burst capacity
+- token refill and partial refill
+- token capacity ceiling
+
+The HTTP tests separately verify that limiter decisions map correctly to `200` and `429`, along with request validation and routing behavior.
 
 ## Project structure
 
 ```text
 src/
-├── limiter.ts       # fixed-window limiter implementation
-├── limiter.test.ts  # limiter unit tests
-├── server.ts        # HTTP server factory and request handler
-├── server.test.ts   # HTTP integration tests
-├── start.ts         # local application entry point
-└── test-utils.ts    # server lifecycle helpers for tests
+├── fixed-window.ts
+├── fixed-window.test.ts
+├── sliding-window-log.ts
+├── sliding-window-log.test.ts
+├── sliding-window-counter.ts
+├── sliding-window-counter.test.ts
+├── token-bucket.ts
+├── token-bucket.test.ts
+├── server.ts
+├── server.test.ts
+├── start.ts
+└── test-utils.ts
 ```
 
 ## Current limitations
 
-This project is **not production-ready yet**. The current version deliberately leaves several important problems unsolved:
+This project is **not production-ready yet**:
 
-- rate-limit state lives only in process memory
-- separate Node processes do not share counters
-- state is lost when the process restarts
+- state lives only in process memory
+- separate Node processes do not share rate-limit state
+- state is lost on restart
+- stale client entries are not evicted
 - `X-Client-Id` is not a secure identity mechanism
-- fixed windows allow bursty behavior around window boundaries
-- stale client entries are not evicted from the in-memory map
-- no distributed atomicity or concurrency guarantees across processes
-- no rate-limit metadata / retry headers yet
-- no metrics, structured logging, or operational observability yet
-- no load or latency benchmarks yet
-
-These are roadmap items rather than hidden shortcomings—the project is being extended only after each previous layer is understood and tested.
+- no distributed atomicity across processes
+- no rate-limit metadata or retry headers yet
+- no structured logging, metrics, or tracing yet
+- no benchmark results yet
 
 ## Roadmap
 
 ### Algorithms
 
-- [x] Fixed window
-- [ ] Sliding window log
-- [ ] Sliding window counter
-- [ ] Token bucket
+- [x] Fixed Window
+- [x] Sliding Window Log
+- [x] Sliding Window Counter
+- [x] Token Bucket
 
-### Measurement
+### Measurement — next
 
-- [ ] Throughput benchmarks
-- [ ] p50 / p95 / p99 latency
-- [ ] Memory usage under high client cardinality
-- [ ] Algorithm trade-off comparison
+- [ ] Build a repeatable benchmark harness
+- [ ] Compare throughput
+- [ ] Compare p50 / p95 / p99 latency
+- [ ] Measure memory under high client cardinality
+- [ ] Compare algorithm behavior under equivalent policies
+- [ ] Document accuracy / burst / memory / CPU trade-offs
 
 ### Distributed implementation
 
@@ -237,7 +223,7 @@ These are roadmap items rather than hidden shortcomings—the project is being e
 ### Production hardening
 
 - [ ] Structured responses and rate-limit metadata
-- [ ] Configuration through environment/runtime config
+- [ ] Runtime/environment configuration
 - [ ] Graceful shutdown
 - [ ] Logging and metrics
 - [ ] Load testing
@@ -245,19 +231,17 @@ These are roadmap items rather than hidden shortcomings—the project is being e
 
 ### Later research / extension
 
-After the core implementation earns the complexity, one deeper extension will be explored—for example adaptive or cost-aware rate limiting, fairness under contention, or multi-region consistency.
+After the core system earns the complexity, one deeper extension can be explored: adaptive or cost-aware rate limiting, fairness under contention, or multi-region consistency.
 
 ## Engineering focus
 
-The goal of this repository is not to accumulate framework code. It is to make the trade-offs visible:
+The point of this repository is to make trade-offs visible rather than accumulate framework code:
 
 - **accuracy vs memory**
 - **burst tolerance vs strictness**
 - **local simplicity vs distributed correctness**
 - **throughput vs coordination cost**
 - **clean abstractions vs unnecessary complexity**
-
-Each new layer is added with tests and evidence before moving on to the next one.
 
 ## License
 

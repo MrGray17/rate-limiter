@@ -55,17 +55,16 @@ export class SlidingWindowCounter {
       state.currentBucketStart = bucketStart;
     }
 
-    const elapsed = currentClock - state.currentBucketStart;
+    const elapsed = currentClock - bucketStart;
 
     const previousBucketWeight =
       (this.windowSize - elapsed) / this.windowSize;
 
-    const estimatedRequests =
+    const estimatedCurrentRequests =
       state.currentBucketCount +
-      state.previousBucketCount * previousBucketWeight +
-      1;
+      state.previousBucketCount * previousBucketWeight;
 
-    if (estimatedRequests >= this.requestLimit) {
+    if (estimatedCurrentRequests + 1 > this.requestLimit) {
       return false;
     }
 

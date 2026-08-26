@@ -1,27 +1,29 @@
 import test from "node:test";
 import assert from "node:assert";
-import { tockenBucket } from "./tocken-bucket.js";
+import { TokenBucket } from "./token-bucket.js";
 
 test("Burst capacity", () => {
   const fakeTime = 0;
-  const tb = new tockenBucket({
-    bucketLimit: 5,
-    tockensPerTimeUnit: 1,
+  const tb = new TokenBucket({
+    capacity: 5,
+    tokensPerTimeUnit: 1,
     timeUnit: 1000,
     clock: () => fakeTime,
   });
+
   for (let i = 0; i < 4; i++) {
     tb.isAllowed("alice");
   }
+
   assert.strictEqual(tb.isAllowed("alice"), true);
   assert.strictEqual(tb.isAllowed("alice"), false);
 });
 
 test("Refill", () => {
   let fakeTime = 0;
-  const tb = new tockenBucket({
-    bucketLimit: 5,
-    tockensPerTimeUnit: 1,
+  const tb = new TokenBucket({
+    capacity: 5,
+    tokensPerTimeUnit: 1,
     timeUnit: 1000,
     clock: () => fakeTime,
   });
@@ -29,16 +31,17 @@ test("Refill", () => {
   for (let i = 0; i < 5; i++) {
     tb.isAllowed("alice");
   }
+
   assert.strictEqual(tb.isAllowed("alice"), false);
   fakeTime = 1000;
   assert.strictEqual(tb.isAllowed("alice"), true);
 });
 
-test("Partial Refill", () => {
+test("Partial refill", () => {
   let fakeTime = 0;
-  const tb = new tockenBucket({
-    bucketLimit: 5,
-    tockensPerTimeUnit: 1,
+  const tb = new TokenBucket({
+    capacity: 5,
+    tokensPerTimeUnit: 1,
     timeUnit: 1000,
     clock: () => fakeTime,
   });
@@ -46,6 +49,7 @@ test("Partial Refill", () => {
   for (let i = 0; i < 5; i++) {
     tb.isAllowed("alice");
   }
+
   assert.strictEqual(tb.isAllowed("alice"), false);
   fakeTime = 500;
   assert.strictEqual(tb.isAllowed("alice"), false);
@@ -55,9 +59,9 @@ test("Partial Refill", () => {
 
 test("Capacity ceiling", () => {
   let fakeTime = 0;
-  const tb = new tockenBucket({
-    bucketLimit: 5,
-    tockensPerTimeUnit: 1,
+  const tb = new TokenBucket({
+    capacity: 5,
+    tokensPerTimeUnit: 1,
     timeUnit: 1000,
     clock: () => fakeTime,
   });
@@ -71,6 +75,7 @@ test("Capacity ceiling", () => {
   for (let i = 0; i < 5; i++) {
     tb.isAllowed("alice");
   }
+
   assert.strictEqual(tb.isAllowed("alice"), false);
   fakeTime = 501_000;
   assert.strictEqual(tb.isAllowed("alice"), true);

@@ -1,5 +1,6 @@
 type UserState = {
   timestamps: number[];
+  oldestIndex: number;
 };
 
 type SlidingWindowLogConfig = {
@@ -28,26 +29,30 @@ export class SlidingWindowLog {
     if (state === undefined) {
       this.users.set(userId, {
         timestamps: [currentClock],
+        oldestIndex: 0,
       });
 
       return true;
     }
 
-    while (state.timestamps.length > 0) {
-      const oldestRequest = state.timestamps[0]!;
+    while (state.timestamps.length - state.oldestIndex > 0) {
+      const oldestRequest = state.timestamps[state.oldestIndex]!;
       const elapsed = currentClock - oldestRequest;
 
       if (elapsed < this.windowSize) {
         break;
       }
 
-      state.timestamps.shift();
+      state.oldestIndex++;
+      if (state.oldestIndex === 50_000) {
+        state.timestamps.splice(0, state.oldestIndex);
+        state.oldestIndex = 0;
+      }
     }
 
-    if (state.timestamps.length >= this.requestLimit) {
+    if (state.timestamps.length - state.oldestIndex >= this.requestLimit) {
       return false;
     }
-
     state.timestamps.push(currentClock);
 
     return true;

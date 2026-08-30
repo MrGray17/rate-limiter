@@ -74,3 +74,19 @@ test("rolling-window boundary behaves correctly", () => {
   assert.strictEqual(swl.isAllowed("alice"), true);
   assert.strictEqual(swl.isAllowed("alice"), false);
 });
+
+test("wrap-around", () => {
+  const swl = new SlidingWindowLog({
+    windowSize: 10_000,
+    requestLimit: 5,
+    clock: () => fakeTime,
+  });
+  let fakeTime = 0;
+
+  for (let i = 0; i < 5; i++) {
+    assert.strictEqual(swl.isAllowed("alice"), true);
+    fakeTime += 2000 ;
+  }
+  assert.strictEqual(swl.isAllowed("alice"), true);
+  assert.strictEqual(swl.isAllowed("alice"), false);
+});

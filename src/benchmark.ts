@@ -8,7 +8,7 @@ import type { Limiter } from "./server.js";
 
 let fakeTime = 0;
 
-const requestLimit = 10_000_000;
+const requestLimit = 10_000;
 const windowSize = 10_000;
 
 const createFixedWindow = () => {
@@ -105,5 +105,5 @@ const benchmark = (
 };
 
 
-benchmark("Fixed Window", createFixedWindow, 500_000, 100_000);
-benchmark("Sliding Window", createSlidingWindowLog, 500_000, 100_000);
+benchmark("Fixed Window", createFixedWindow, 500_000, 500_000);
+benchmark("Sliding Window", createSlidingWindowLog, 500_000, 500_000);

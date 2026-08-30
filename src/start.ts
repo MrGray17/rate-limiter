@@ -1,35 +1,62 @@
-import { createMyServer } from "./server.js";
-import { FixedWindow } from "./fixed-window.js";
-import { SlidingWindowLog } from "./sliding-window-log.js";
-import { SlidingWindowCounter } from "./sliding-window-counter.js";
+import { createRateLimitServer } from "./server.js";
 import { TokenBucket } from "./token-bucket.js";
 
-const fixedWindow = new FixedWindow({
-  windowSize: 10_000,
-  requestLimit: 5,
+const readPositiveInteger = (name: string, fallback: number) => {
+  const rawValue = process.env[name];
+
+  if (rawValue === undefined) {
+    return fallback;
+  }
+
+  const parsed = Number(rawValue);
+
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+
+  return parsed;
+};
+
+const host = process.env.HOST ?? "0.0.0.0";
+const port = readPositiveInteger("PORT", 3000);
+
+const limiter = new TokenBucket({
+  capacity: readPositiveInteger("RATE_LIMIT_CAPACITY", 100),
+  tokensPerTimeUnit: readPositiveInteger("RATE_LIMIT_REFILL", 100),
+  timeUnit: readPositiveInteger("RATE_LIMIT_TIME_UNIT_MS", 60_000),
   clock: () => Date.now(),
 });
 
-const slidingWindowLog = new SlidingWindowLog({
-  windowSize: 10_000,
-  requestLimit: 5,
-  clock: () => Date.now(),
+const server = createRateLimitServer(limiter);
+
+server.on("error", (error) => {
+  console.error("HTTP server error", error);
+  process.exitCode = 1;
 });
 
-const slidingWindowCounter = new SlidingWindowCounter({
-  windowSize: 10_000,
-  requestLimit: 5,
-  clock: () => Date.now(),
+server.listen(port, host, () => {
+  console.log(`Rate limiter listening on http://${host}:${port}`);
 });
 
-const tokenBucket = new TokenBucket({
-  capacity: 5,
-  tokensPerTimeUnit: 1,
-  timeUnit: 1000,
-  clock: () => Date.now(),
-});
+let shuttingDown = false;
 
-const activeLimiter = tokenBucket;
+const shutdown = (signal: NodeJS.Signals) => {
+  if (shuttingDown) {
+    return;
+  }
 
-const server = createMyServer(activeLimiter);
-server.listen(3000);
+  shuttingDown = true;
+  console.log(`${signal} received, shutting down gracefully`);
+
+  server.close((error) => {
+    if (error) {
+      console.error("Failed to close HTTP server cleanly", error);
+      process.exitCode = 1;
+    }
+  });
+
+  server.closeIdleConnections();
+};
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));

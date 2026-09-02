@@ -150,6 +150,19 @@ export const createRateLimitServer = (limiter: Limiter) => {
       });
     }
   );
-
+server.requestTimeout = 10_000;
+server.headersTimeout = 5_000;
+server.keepAliveTimeout = 5_000;
+server.maxRequestsPerSocket = 1_000;
+server.on("clientError", (_error, socket) => {
+  if (socket.writable) { //means can we still send data through this connection?
+    socket.end(
+      "HTTP/1.1 400 Bad Request\r\n" +   //\return\new
+      "Connection: close\r\n" +
+      "Content-Length: 0\r\n" +
+      "\r\n"
+    );
+  }
+});
   return server;
 };

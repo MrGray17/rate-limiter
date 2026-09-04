@@ -9,7 +9,7 @@ export interface Limiter {
 const sendJson = (
   response: ServerResponse,
   statusCode: number,
-  body: Record<string, unknown>
+  body: Record<string, unknown>,
 ) => {
   const payload = JSON.stringify(body);
 
@@ -22,10 +22,7 @@ const sendJson = (
   response.end(payload);
 };
 
-const methodNotAllowed = (
-  response: ServerResponse,
-  expectedMethod: string
-) => {
+const methodNotAllowed = (response: ServerResponse, expectedMethod: string) => {
   response.setHeader("allow", expectedMethod);
 
   sendJson(response, 405, {
@@ -39,7 +36,7 @@ const methodNotAllowed = (
 const handleCheck = async (
   request: IncomingMessage,
   response: ServerResponse,
-  limiter: Limiter
+  limiter: Limiter,
 ) => {
   if (request.method !== "POST") {
     methodNotAllowed(response, "POST");
@@ -100,17 +97,11 @@ export const createRateLimitServer = (limiter: Limiter) => {
 
       response.setHeader("x-request-id", requestId);
 
-      const requestUrl = new URL(
-        request.url ?? "/",
-        "http://localhost"
-      );
+      const requestUrl = new URL(request.url ?? "/", "http://localhost");
 
       if (requestUrl.pathname === "/check") {
         void handleCheck(request, response, limiter).catch((error) => {
-          console.error(
-            `Unhandled HTTP request error [${requestId}]`,
-            error
-          );
+          console.error(`Unhandled HTTP request error [${requestId}]`, error);
 
           if (!response.headersSent) {
             sendJson(response, 500, {
@@ -148,21 +139,22 @@ export const createRateLimitServer = (limiter: Limiter) => {
           message: "Path Not Found",
         },
       });
-    }
+    },
   );
-server.requestTimeout = 10_000;
-server.headersTimeout = 5_000;
-server.keepAliveTimeout = 5_000;
-server.maxRequestsPerSocket = 1_000;
-server.on("clientError", (_error, socket) => {
-  if (socket.writable) { //means can we still send data through this connection?
-    socket.end(
-      "HTTP/1.1 400 Bad Request\r\n" +   //\return\new
-      "Connection: close\r\n" +
-      "Content-Length: 0\r\n" +
-      "\r\n"
-    );
-  }
-});
+  server.requestTimeout = 10_000;
+  server.headersTimeout = 5_000;
+  server.keepAliveTimeout = 5_000;
+  server.maxRequestsPerSocket = 1_000;
+  server.on("clientError", (_error, socket) => {  //listens for when we receive clientError
+    if (socket.writable) {
+      //means can we still send data through this connection?
+      socket.end(
+        "HTTP/1.1 400 Bad Request\r\n" + //\return\new
+          "Connection: close\r\n" +
+          "Content-Length: 0\r\n" +
+          "\r\n",
+      );
+    }
+  });
   return server;
 };

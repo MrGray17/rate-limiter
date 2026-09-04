@@ -1,62 +1,59 @@
 import { createRateLimitServer } from "./server.js";
 import { TokenBucket } from "./token-bucket.js";
 
-const readPositiveInteger = (name: string, fallback: number) => {
-  const rawValue = process.env[name];
-
-  if (rawValue === undefined) {
+const EnvHelper = (name: string, fallback: number): number => {
+  const content = process.env[name];
+  if (content === undefined) {
     return fallback;
   }
-
-  const parsed = Number(rawValue);
-
-  if (!Number.isInteger(parsed) || parsed <= 0) {
-    throw new Error(`${name} must be a positive integer`);
+  const NumContent = Number(content);
+  if (Number.isInteger(NumContent) && NumContent > 0) {
+    return NumContent;
   }
-
-  return parsed;
+  throw new Error(`${name} must be a positive integer`);
 };
 
-const host = process.env.HOST ?? "0.0.0.0";
-const port = readPositiveInteger("PORT", 3000);
+const HostHandler = (fallback: string): string => {
+  //we work with strings
+  const host = process.env.HOST; //because addresses are not numbers (NaN)
+  if (host === undefined) {
+    return fallback;
+  }
+  if (host.trim().length === 0) {
+    throw new Error("HOST must not be empty");
+  }
+  return host.trim();
+};
 
 const limiter = new TokenBucket({
-  capacity: readPositiveInteger("RATE_LIMIT_CAPACITY", 100),
-  tokensPerTimeUnit: readPositiveInteger("RATE_LIMIT_REFILL", 100),
-  timeUnit: readPositiveInteger("RATE_LIMIT_TIME_UNIT_MS", 60_000),
+  capacity: EnvHelper("RATE_LIMIT_CAPACITY", 10),
+  tokensPerTimeUnit: EnvHelper("RATE_LIMIT_REFILL", 1),
+  timeUnit: EnvHelper("RATE_LIMIT_TIME_UNIT_MS", 1000),
   clock: () => Date.now(),
 });
 
 const server = createRateLimitServer(limiter);
-
-server.on("error", (error) => {
-  console.error("HTTP server error", error);
-  process.exitCode = 1;
-});
-
+const port = EnvHelper("PORT", 3000);
+const host = HostHandler("0.0.0.0");
 server.listen(port, host, () => {
-  console.log(`Rate limiter listening on http://${host}:${port}`);
+  console.log(`Server running on http://${host}:${port}`);
 });
+server.on("error" , (error) => {
+  console.error("HTTP server error:", error);
+  process.exitCode = 1;
+})
 
-let shuttingDown = false;
+let currentlyShuttingDown = false ;
 
-const shutdown = (signal: NodeJS.Signals) => {
-  if (shuttingDown) {
-    return;
+const GracefulShut = () => {
+  if (currentlyShuttingDown) {
+    return ;
   }
+  console.log ("Server shutting down ...")
+  server.close(() => {
+    console.log ("Server shut")
+  })
+}
+process.on("SIGINT" , GracefulShut )
+process.on("SIGTERM" , GracefulShut)
 
-  shuttingDown = true;
-  console.log(`${signal} received, shutting down gracefully`);
-
-  server.close((error) => {
-    if (error) {
-      console.error("Failed to close HTTP server cleanly", error);
-      process.exitCode = 1;
-    }
-  });
-
-  server.closeIdleConnections();
-};
-
-process.on("SIGINT", () => shutdown("SIGINT"));
-process.on("SIGTERM", () => shutdown("SIGTERM"));

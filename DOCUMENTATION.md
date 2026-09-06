@@ -10,7 +10,7 @@
 
 The project started as a deliberately small backend systems exercise: implement a rate limiter from first principles in TypeScript and then keep pushing it until it exposed real engineering problems.
 
-The goal was not to build a CRUD application around a rate limiter. The goal was to use one narrow component to study:
+The goal was not to wrap a counter in an API and stop. The goal was to use one narrow component to study:
 
 - state modeling
 - time-based algorithms
@@ -19,13 +19,29 @@ The goal was not to build a CRUD application around a rate limiter. The goal was
 - deterministic testing
 - HTTP integration
 - dependency injection
+- asynchronous dependencies
 - benchmarking
-- runtime behavior and JIT warm-up
+- V8/JIT behavior
 - memory vs CPU trade-offs
-- data-structure choices
-- eventually distributed correctness with Redis
+- data-structure design
+- process lifecycle and configuration
+- shared state with Redis
+- distributed atomicity
+- concurrency and failure behavior
 
 The project therefore evolved in layers rather than being designed as a large framework from day one.
+
+The recurring engineering rule has been:
+
+```text
+problem
+-> evidence
+-> hypothesis
+-> smallest useful change
+-> correctness tests
+-> measurement
+-> conclusion
+```
 
 ---
 
@@ -112,7 +128,7 @@ Instead of hardcoding:
 Date.now()
 ```
 
-inside the algorithms, each limiter receives a clock function:
+inside the in-memory algorithms, each limiter receives a clock function:
 
 ```ts
 clock: () => number
@@ -141,7 +157,7 @@ without sleeping for eleven real seconds.
 
 ### Why this mattered later
 
-The injected clock became useful for much more than tests. It also became the foundation for controlled benchmarks.
+The injected clock also became the foundation for controlled benchmarks.
 
 There are two separate clocks in the benchmark:
 
@@ -150,83 +166,165 @@ fakeTime
     = simulated time seen by the limiter
 
 performance.now()
-    = real high-resolution stopwatch used to measure CPU execution time
+    = real high-resolution stopwatch used to measure execution time
 ```
 
-This distinction became central when benchmarking window transitions and timestamp expiration.
+This distinction became central when benchmarking expiration, refill, and bucket transitions.
+
+### Important limit of fake time
+
+Fake time only controls code that receives the injected clock.
+
+Once expiration moved into Redis using `EXPIRE`, Redis became the owner of the TTL and uses its own real clock. A TypeScript `fakeTime` variable cannot advance Redis time. Redis integration tests therefore use a short real TTL and a real wait.
 
 ---
 
 ## 4. HTTP Integration Without Coupling the Algorithm to HTTP
 
-After the single-process limiter worked, the next layer was an HTTP boundary.
+After the single-process limiter worked, the next layer was an HTTP boundary built with Node's `http` module.
 
-The API was kept intentionally small:
+### Routes
 
-### `POST /check`
+#### `POST /check`
 
 Uses `X-Client-Id` as a development client identifier.
 
-Possible responses:
+Current response behavior includes:
 
 - `200` — limiter allowed the request
 - `429` — quota exhausted
-- `400` — missing/invalid client ID
-- `405` — wrong method
+- `400` — missing/blank client ID
+- `405` — wrong method, with `Allow` header
+- `503` — the limiter dependency failed
+- `500` — unexpected request-handler failure
 
-### `GET /health`
+#### `GET /health`
 
-- `200` when the server is running
+Returns structured JSON health status.
 
-### Unknown paths
+#### Unknown paths
 
-- `404`
+Return structured `404` JSON.
 
-### Shared limiter contract
+### Structured response helper
 
-The HTTP server should not care whether it is using Fixed Window, Sliding Window Log, Sliding Window Counter, or Token Bucket.
+A small `sendJson()` helper centralizes:
 
-The server therefore depends only on:
+- `JSON.stringify`
+- status code
+- `content-type`
+- `content-length` using `Buffer.byteLength`
+- `cache-control: no-store`
+- `response.end(payload)`
+
+This avoided repeating HTTP mechanics in each route branch.
+
+### Request IDs
+
+Each request receives an `X-Request-Id` generated with `randomUUID()`.
+
+This creates the beginning of request correlation for logs and later observability work.
+
+### Path parsing
+
+The server uses:
 
 ```ts
-export interface Limiter {
+new URL(request.url ?? "/", "http://localhost")
+```
+
+and routes on `pathname`, so query strings do not accidentally change route matching.
+
+---
+
+## 5. The Limiter Contract Had to Become Async-Compatible
+
+Originally the HTTP layer only needed synchronous in-memory algorithms:
+
+```ts
+interface Limiter {
   isAllowed(userId: string): boolean;
 }
 ```
 
-and receives the concrete limiter from the outside:
+Redis introduced network I/O, so a distributed limiter naturally returns a Promise.
+
+Instead of coupling the server to Redis, the shared contract evolved to:
 
 ```ts
-createMyServer(limiter)
+export interface Limiter {
+  isAllowed(userId: string): boolean | Promise<boolean>;
+}
 ```
 
-This is dependency injection.
+The HTTP layer now does:
 
-The important separation is:
+```ts
+allowed = await limiter.isAllowed(user.trim());
+```
+
+This was an important architecture decision:
 
 ```text
-Algorithm tests
-    -> Is rate limiting correct?
-
-Server tests
-    -> Does HTTP translate limiter decisions correctly?
+HTTP server
+    |
+    v
+Limiter interface
+    |
+    +--> synchronous in-memory implementation
+    |
+    +--> asynchronous Redis implementation
 ```
 
-The server tests were therefore changed to use tiny fake limiters that simply return allow/reject decisions instead of re-testing a real algorithm through HTTP.
+The server does not need to know which one it received.
 
-That reduced coupling and made failures easier to interpret.
+### Failure boundary
+
+A limiter failure is treated differently from an unexpected server bug:
+
+```text
+limiter dependency fails
+-> 503 LIMITER_UNAVAILABLE
+
+unexpected HTTP handler failure
+-> 500 INTERNAL_SERVER_ERROR
+```
+
+This distinction matters because a Redis/network outage is not the same category of failure as a programming error in request handling.
 
 ---
 
-## 5. Sliding Window Log
+## 6. HTTP Runtime Hardening
 
-### Why implement it
+The raw Node server was hardened with explicit runtime settings:
+
+```ts
+server.requestTimeout = 10_000;
+server.headersTimeout = 5_000;
+server.keepAliveTimeout = 5_000;
+server.maxRequestsPerSocket = 1_000;
+```
+
+A `clientError` listener also returns a minimal `400 Bad Request` over the socket when possible.
+
+This phase introduced several lower-level ideas that frameworks often hide:
+
+- a server object is an event emitter
+- `listen()` begins accepting connections
+- `response.end()` finishes the HTTP response but does not return from the JavaScript function automatically
+- sockets can still be writable after a parser/client error
+- `\r\n` is part of raw HTTP formatting
+- request/headers/keep-alive timeouts protect different phases of a connection
+
+---
+
+## 7. Sliding Window Log
 
 Fixed Window is cheap but has boundary burst behavior.
 
-Sliding Window Log aims to enforce a true rolling window by remembering the exact timestamps of accepted requests.
+Sliding Window Log enforces a true rolling window by remembering exact accepted-request timestamps.
 
-Initial user state:
+Initial state:
 
 ```ts
 type UserState = {
@@ -234,32 +332,34 @@ type UserState = {
 };
 ```
 
-For each request:
+Per request:
 
 1. remove timestamps outside the rolling window
-2. count how many timestamps remain
+2. count how many remain
 3. reject if the limit is reached
 4. otherwise append the current timestamp
 
-### Initial cleanup implementation
+### First implementation
 
-The first implementation used:
+The original cleanup used:
 
 ```ts
 state.timestamps.shift();
 ```
 
-inside a loop while timestamps were expired.
+inside a loop while old timestamps were expired.
 
-It was correct and simple, so it was deliberately kept until evidence showed it was a problem.
+It was correct and simple, so it was kept until measurement showed it was expensive.
 
-This was an important project rule: **do not optimize a data structure just because a more advanced one exists. Measure first.**
+This became an important project rule:
+
+> Do not optimize a data structure just because a more advanced one exists. Measure first.
 
 ---
 
-## 6. Sliding Window Counter
+## 8. Sliding Window Counter
 
-Sliding Window Counter was introduced to explore an approximation that uses much less memory than storing every timestamp.
+Sliding Window Counter was added as an approximation that uses much less memory than an exact timestamp log.
 
 ### State
 
@@ -271,8 +371,6 @@ It tracks approximately:
 
 ### Weighted estimate
 
-The previous bucket contributes according to how much of it still overlaps the rolling window.
-
 Conceptually:
 
 ```text
@@ -283,15 +381,13 @@ current bucket count
 previous bucket count * overlap weight
 ```
 
-If the current bucket is already 70% complete, only about 30% of the previous bucket is treated as overlapping.
+If the current bucket is 70% complete, only about 30% of the previous bucket is treated as overlapping.
 
-### Important correctness bug
+### Exact-limit bug
 
-A boundary bug appeared around the exact limit.
+An important boundary bug appeared when the incoming request was included in the prospective estimate but rejection used `>= requestLimit`.
 
-The earlier logic effectively included the incoming request in the estimate and rejected using `>= requestLimit`, which could reject a request that should bring the user **exactly to** the limit.
-
-The corrected reasoning was prospective:
+The corrected reasoning became:
 
 ```ts
 const estimatedCurrentRequests =
@@ -303,29 +399,18 @@ if (estimatedCurrentRequests + 1 > this.requestLimit) {
 }
 ```
 
-The distinction is:
+The semantic rule is:
 
 ```text
 exactly at limit -> allowed
 above limit      -> rejected
 ```
 
-A regression test was kept so the boundary bug cannot silently return.
-
-### Trade-off
-
-Sliding Window Counter buys:
-
-- small, fixed state per user
-- inexpensive operations
-
-at the cost of:
-
-- approximate rather than exact rolling-window accounting
+A regression test was kept for this boundary.
 
 ---
 
-## 7. Token Bucket
+## 9. Token Bucket
 
 Token Bucket introduced a different policy model.
 
@@ -341,34 +426,23 @@ lastRefillTime
 ### Rules
 
 - bucket starts with a maximum capacity
-- each allowed request consumes one token
+- an allowed request consumes one token
 - tokens regenerate according to elapsed time
 - tokens cannot exceed capacity
-- requests are rejected if fewer than one token is available
-
-### Why it is useful
+- a request is rejected if fewer than one token is available
 
 Token Bucket naturally separates:
 
 - burst capacity
 - sustained rate
 
-A client can use accumulated tokens in a short burst, while the refill rate controls long-term traffic.
-
-Tests cover:
-
-- initial burst capacity
-- refill after elapsed time
-- partial refill
-- capacity ceiling
-
-Manual HTTP testing also showed an important real-time behavior: while commands are being typed, real time passes and tokens may regenerate between requests.
+This made it useful both as a production candidate for the in-memory HTTP server and as a contrast with window-based policies.
 
 ---
 
-## 8. Testing Strategy
+## 10. Testing Strategy for In-Memory Algorithms
 
-The project uses deterministic clocks for algorithm tests.
+The in-memory algorithms use deterministic injected clocks.
 
 Important cases include:
 
@@ -385,8 +459,8 @@ Important cases include:
 - same-window limit
 - timestamp expiration
 - independent users
-- rolling-window boundary behavior
-- ring-buffer wrap-around after later optimization
+- rolling-window boundaries
+- ring-buffer wrap-around after optimization
 
 ### Sliding Window Counter
 
@@ -407,11 +481,19 @@ Important cases include:
 
 HTTP tests use fake limiter implementations so they test routing and response mapping independently from algorithm correctness.
 
-At the point where the Sliding Window Log ring-buffer rewrite was completed, the full suite had 24 passing tests, and `npm run typecheck` passed with no TypeScript errors.
+This keeps two questions separate:
+
+```text
+algorithm tests
+-> Is rate limiting correct?
+
+server tests
+-> Does HTTP translate limiter decisions correctly?
+```
 
 ---
 
-## 9. Entering the Benchmarking Phase
+## 11. Entering the Benchmarking Phase
 
 The first benchmark was intentionally tiny:
 
@@ -425,141 +507,90 @@ for (let i = 0; i < iterations; i++) {
 const end = performance.now();
 ```
 
-### Throughput
+Throughput is calculated as:
 
 ```text
 throughput = operations / elapsed seconds
 ```
 
-For example:
-
-```text
-1,000,000 operations
-50 ms = 0.05 seconds
-
-1,000,000 / 0.05
-= 20,000,000 ops/sec
-```
-
-This is **algorithm operations per second**, not HTTP requests per second. The benchmark bypasses networking and HTTP entirely.
+This is **algorithm operations per second**, not HTTP requests per second. The benchmark bypasses networking, parsing, serialization, and Redis.
 
 ---
 
-## 10. Why Benchmark Results Changed Between Runs
+## 12. Why Benchmark Results Changed Between Runs
 
-Early Fixed Window runs varied substantially, for example around 24–40 ms for one million operations.
+Early runs varied substantially.
 
-That led to investigating benchmark noise.
-
-Possible sources include:
+That led to investigating benchmark noise from sources such as:
 
 - V8 JIT optimization
 - OS scheduling
 - CPU frequency changes
 - cache state
 - garbage collection
-- other processes running on the machine
+- unrelated processes
 
 ### JIT warm-up
 
-V8 can observe frequently executed (“hot”) JavaScript and optimize it while the program is running.
+V8 can optimize frequently executed JavaScript while the process is running.
 
-A benchmark that starts measuring immediately can accidentally mix:
+A benchmark that measures immediately can mix:
 
 ```text
 cold execution
 +
 JIT optimization work
 +
-warmed/optimized execution
+warmed execution
 ```
 
-The harness therefore performs unmeasured warm-up iterations before the measured runs.
+The harness therefore performs unmeasured warm-up iterations before measured runs.
 
-Important detail: warm-up must happen in the **same Node process** as the benchmark. Launching `npx tsx ...` again creates a new process and does not preserve the previous process’s JIT state.
+Warm-up must happen in the **same Node process**. Starting a new `npx tsx ...` process does not preserve the previous process's JIT state.
 
 ---
 
-## 11. Why Multiple Runs and Median Were Added
+## 13. Multiple Runs and Median
 
 One run is weak evidence.
 
-The benchmark was changed to run the same experiment multiple times and store elapsed times in an array.
-
-Example:
-
-```text
-[164, 168, 161, 205, 166, ...]
-```
+The benchmark now repeats the same experiment and stores elapsed times.
 
 The values are sorted and the median is calculated.
 
-### Why median instead of only mean
+Median is useful because short microbenchmarks can contain occasional slow spikes from runtime or OS interference.
 
-Slow outlier runs are still real measurements, but they may include OS/runtime interference unrelated to the typical steady-state cost of the algorithm.
+The important lesson was not “median is always best.” It was:
 
-Example:
-
-```text
-10, 10, 10, 10, 100
-```
-
-Mean:
-
-```text
-28
-```
-
-Median:
-
-```text
-10
-```
-
-For “typical steady-state execution,” median is resistant to isolated spikes.
-
-The correct interpretation is not to delete inconvenient data. A useful benchmark can eventually report multiple statistics such as:
-
-- median
-- mean
-- min/max
-- p95/p99
+> Keep the workload and the raw measurements visible, and do not turn one noisy number into a universal performance claim.
 
 ---
 
-## 12. Fresh State Per Benchmark Run
+## 14. Fresh State Per Benchmark Run
 
-A benchmark run must start from comparable state.
+Reusing a limiter instance across benchmark runs changes the state being measured.
 
-If the same limiter instance is reused across runs, Run 2 may benchmark a different branch than Run 1 because Alice’s quota has already been consumed.
-
-The solution was a **factory function**:
+The solution was a factory:
 
 ```ts
 const createFixedWindow = () => new FixedWindow(...);
 ```
 
-and a generic benchmark parameter:
+and a generic benchmark input:
 
 ```ts
-const benchmark = (createLimiter: () => Limiter, ...) => {
-  const limiter = createLimiter();
-};
+createLimiter: () => Limiter
 ```
 
-This means each measured run receives a fresh limiter.
+Each measured run receives fresh limiter state, and `fakeTime` is reset.
 
-Factories were created for all four algorithms because they have different configuration requirements.
-
-This also reinforced the meaning of the shared `Limiter` interface: the benchmark only needs an object with `isAllowed(userId): boolean`; it does not need to know the concrete class.
+This reinforced the meaning of the shared interface: the benchmark needs something that can answer `isAllowed`, not knowledge of the concrete class.
 
 ---
 
-## 13. Controlled Simulated Time in Benchmarks
+## 15. Controlled Simulated Time in Benchmarks
 
-At first, `fakeTime` remained `0` throughout the measured loop.
-
-That means the limiter sees:
+A frozen fake clock measures a very specific path:
 
 ```text
 request 1 -> t=0
@@ -568,27 +599,14 @@ request 3 -> t=0
 ...
 ```
 
-Consequences:
+Under that workload:
 
-### Fixed Window
+- Fixed Window never resets
+- Sliding Window Log never expires timestamps
+- Sliding Window Counter never changes buckets
+- Token Bucket never refills
 
-The window never expires.
-
-### Sliding Window Log
-
-No timestamp expires.
-
-### Sliding Window Counter
-
-No bucket transition occurs.
-
-### Token Bucket
-
-No refill occurs.
-
-This is a valid benchmark scenario, but it only measures one specific path.
-
-To exercise time-dependent behavior, the benchmark was changed to simulate:
+To exercise time-dependent behavior, the benchmark advances:
 
 ```ts
 fakeTime += 1;
@@ -596,168 +614,44 @@ fakeTime += 1;
 
 per request.
 
-So:
-
-```text
-request 1 -> 0 ms
-request 2 -> 1 ms
-request 3 -> 2 ms
-...
-```
-
-Every measured run resets:
-
-```ts
-fakeTime = 0;
-```
-
-so each experiment sees the same timeline.
-
-This is preferable to `Date.now()` because the benchmark controls the exact scenario rather than letting wall-clock timing vary between runs.
-
----
-
-## 14. First Cross-Algorithm Benchmark and Why It Was Not Enough
-
-An early common workload used roughly:
-
-- 500,000 measured operations
-- 100,000 warm-up operations
-- 10 measured runs
-- fake time initially frozen
-
-Example medians from one run were approximately:
-
-```text
-Fixed Window             11.88 ms
-Sliding Window Log       10.70 ms
-Sliding Window Counter    6.53 ms
-Token Bucket              6.58 ms
-```
-
-These numbers were **not treated as a final ranking**.
-
-Why not?
-
-1. the individual runs were very short and noisy
-2. fake time was frozen, so important time-transition paths were not exercised
-3. Token Bucket’s refill policy was not yet equivalent to the window-based algorithms
-4. microbenchmark throughput is workload-specific and is not server throughput
-
-This became an important benchmarking rule:
-
-> A benchmark number is meaningless without the workload and policy that produced it.
-
----
-
-## 15. Measuring Total Benchmark Time
-
-The harness initially measured only the inner `isAllowed()` loop.
-
-A second timer was added around the whole benchmark call.
-
-This distinguishes:
-
-```text
-inner measured time
-    -> limiter operations
-
-whole benchmark time
-    -> warm-up + allocations + logs + sorting + possible GC + other harness work
-```
-
-This helped prevent accidentally attributing every delay in the process to the limiter itself.
+This creates a deterministic traffic timeline while `performance.now()` remains the real stopwatch.
 
 ---
 
 ## 16. Sliding Window Log Performance Investigation
 
-This became the most valuable optimization story in the project.
+This became the strongest optimization story in the project.
 
-### Step A — frozen time
+With advancing time and a 10,000 ms window, old timestamps began expiring continuously.
 
-With `fakeTime = 0`, Sliding Window Log mostly performed:
-
-```text
-Map lookup
-check oldest timestamp
-push current timestamp
-```
-
-because timestamps never expired.
-
-### Step B — advance time by 1 ms/request
-
-With:
-
-```ts
-fakeTime += 1;
-```
-
-and:
-
-```text
-windowSize = 10,000 ms
-500,000 requests
-```
-
-old timestamps started expiring after the first ~10,000 requests.
-
-Sliding Window Log median moved to roughly 35–39 ms while Fixed Window remained around 8–11 ms under the same advancing-time workload.
-
-Reversing benchmark order did not remove the difference, which strengthened the evidence that the slowdown was algorithm-specific rather than merely caused by whichever algorithm ran first.
-
----
-
-## 17. Finding the `shift()` Bottleneck
-
-With one request per simulated millisecond and a 10,000 ms window, the active log stays around 10,000 timestamps.
-
-Across 500,000 requests:
-
-```text
-500,000 total
-- 10,000 before expiration begins
-≈ 490,000 expirations
-```
-
-The original cleanup performed approximately:
+The original implementation repeatedly performed:
 
 ```ts
 state.timestamps.shift();
 ```
 
-for each expiration.
+Removing from the front of a JavaScript array can require expensive internal movement/reindexing.
 
-Removing the first element of a JavaScript array can require expensive internal work/reindexing compared with appending at the end.
+With roughly 500,000 requests and a 10,000-entry active window, expiration-heavy traffic could trigger approximately hundreds of thousands of front removals.
 
-The critical observation was therefore:
-
-```text
-~490,000 front removals
-from an array containing around 10,000 active entries
-```
-
-This was the strongest performance hypothesis.
-
-The project did **not** immediately rewrite the algorithm when `shift()` looked suspicious. The sequence was:
+The investigation sequence was:
 
 ```text
 observe slowdown
 -> reproduce it
--> compare against Fixed Window control workload
+-> compare against a control workload
 -> estimate how often shift() runs
 -> form bottleneck hypothesis
 -> change data structure
--> run tests
+-> run correctness tests
 -> rerun same benchmark
 ```
 
 ---
 
-## 18. Optimization #1: Head Index Instead of `shift()`
+## 17. Optimization #1: Head Index
 
-Instead of physically deleting the first timestamp every time, the log began tracking which index is the oldest valid timestamp.
+Instead of physically deleting the first timestamp every time, the implementation tracked the logical oldest index.
 
 Conceptually:
 
@@ -775,63 +669,38 @@ After 10 expires:
 oldestIndex = 1
 ```
 
-The value `10` remains physically in the array but is ignored.
-
 Expiration becomes approximately:
 
 ```text
 oldestIndex++
 ```
 
-instead of a front deletion on every request.
+rather than `shift()`.
 
 ### Important state-model correction
 
-At first, `oldestIndex` was declared locally inside `isAllowed()`. That would reset it to zero on every request.
+`oldestIndex` was first considered as a local variable, but that would reset it on every request.
 
-The correct design was to store it in `UserState`, because it is persistent per-client state.
+It belongs in persistent per-user state.
 
-### Compaction trade-off
+### New trade-off
 
-Dead timestamps still occupied the prefix of the array, so occasional `splice()` compaction was introduced after a threshold.
+The head-index design leaves dead entries at the front of the array and eventually needs compaction, creating a memory-versus-compaction-frequency trade-off.
 
-This exposed a new trade-off:
-
-```text
-small threshold
--> less dead memory
--> more frequent expensive compaction
-
-large threshold
--> more dead memory
--> less frequent compaction
-```
-
-The initial threshold (`50_000`) was recognized as a magic number rather than a justified final design.
-
-### Result
-
-Under the same advancing-time workload, the median dropped from roughly 35–39 ms to around 11 ms.
-
-That was strong evidence that repeated front deletion was a major bottleneck.
+That motivated the next design.
 
 ---
 
-## 19. Optimization #2: Circular / Ring Buffer
+## 18. Optimization #2: Ring Buffer
 
-The head-index version solved repeated `shift()` cost but introduced the dead-prefix/compaction trade-off.
+The exact sliding log needs FIFO behavior:
 
-The next question was whether expired slots could simply be reused.
+- append newest timestamp
+- expire oldest timestamp
 
-That led to a ring buffer.
+A ring buffer allows expired slots to be reused.
 
-### Key observation
-
-If `requestLimit = 5`, the limiter never needs more than 5 **valid accepted timestamps** at once. Once five are active, more requests are rejected.
-
-Therefore the log can use bounded storage related to the rate limit instead of an ever-growing array.
-
-### Ring-buffer state
+State became conceptually:
 
 ```ts
 type UserState = {
@@ -845,245 +714,689 @@ type UserState = {
 Meaning:
 
 ```text
-head
-    -> index of the oldest valid timestamp
-
-tail
-    -> index where the next accepted timestamp is written
-
-count
-    -> number of valid timestamps currently stored
+head  -> oldest valid timestamp
+tail  -> next write position
+count -> number of valid active timestamps
 ```
 
-### Why `count` exists
-
-In a circular buffer, `head === tail` can mean either empty or full depending on the state.
-
-`count` removes that ambiguity and makes the limit check explicit.
-
-### Circular movement
+Circular movement uses:
 
 ```ts
 nextIndex = (currentIndex + 1) % capacity;
 ```
 
-Modulo wraps the index:
-
-```text
-0 -> 1 -> 2 -> 3 -> 4 -> 0 -> ...
-```
-
-### Expiration
-
-Instead of deleting:
-
-```text
-while count > 0:
-    inspect timestamps[head]
-    if still valid: stop
-    else:
-        head = next circular index
-        count--
-```
-
-### Accepting a request
-
-```text
-if count >= requestLimit:
-    reject
-
-write current timestamp at tail
-tail = next circular index
-count++
-allow
-```
-
-The old slot is eventually overwritten after it is no longer part of the valid window.
-
-### Why this design is attractive
-
-It avoids:
+The ring buffer avoids:
 
 - repeated `shift()`
-- an ever-growing dead prefix
+- ever-growing dead prefixes
 - arbitrary compaction thresholds
 - periodic large `splice()` operations
 
-and provides bounded per-user timestamp storage relative to the limit.
+A dedicated wrap-around regression test was added because existing tests could pass without exercising the circular behavior.
 
 ---
 
-## 20. Ring-Buffer Regression Test
+## 19. Benchmark Outcome and Interpretation
 
-Changing a data structure creates new failure modes even if old tests still pass.
+The important performance conclusion was not a universal ranking of algorithms. It was the evidence-driven improvement of the Sliding Window Log implementation.
 
-A specific wrap-around test was added with a small request limit so the tail reaches the end and wraps quickly.
+The original `shift()` cleanup became much slower under expiration-heavy advancing-time workloads. The head-index design removed most of that cost, and the ring-buffer version eliminated the dead-prefix/compaction design problem.
 
-Example timeline:
+A later representative four-way benchmark used:
+
+- 1,000,000 measured operations
+- 500,000 warm-up operations
+- 10 measured runs
+- 10,000 request limit
+- 10,000 ms window
+- 1 ms of simulated time per request
+- Token Bucket refill configured to match the equivalent sustained rate
+
+One representative set of medians was approximately:
 
 ```text
-t = 0     accepted
-t = 2000  accepted
-t = 4000  accepted
-t = 6000  accepted
-t = 8000  accepted
+Fixed Window             20.42 ms
+Sliding Window Log       15.27 ms
+Sliding Window Counter   14.79 ms
+Token Bucket             12.40 ms
 ```
 
-With a 10-second window and limit of 5, at `t = 10,000` the request from `t = 0` expires.
+These numbers are workload-specific microbenchmark results, not HTTP throughput claims and not proof that one algorithm is universally fastest.
 
-The next request should be accepted and reuse the circular buffer, and an immediate additional request should be rejected because the active count is back at 5.
+The durable lesson is:
 
-The test deliberately checks **observable behavior** rather than asserting that a specific physical slot was reused. This keeps the test valid even if the internal representation changes again later.
+> Benchmark the implementation path and policy under a defined workload, not an algorithm name in isolation.
 
 ---
 
-## 21. Ring-Buffer Benchmark Results
+## 20. Startup Configuration: Environment Variables
 
-An early ring-buffer benchmark still used:
+The server startup path was rebuilt to read runtime configuration from environment variables.
 
-```text
-requestLimit = 10,000,000
-iterations   = 500,000
-```
+A helper validates positive integer settings such as:
 
-That meant the tail never actually wrapped, so the benchmark was not exercising the core circular behavior.
+- `PORT`
+- `RATE_LIMIT_CAPACITY`
+- `RATE_LIMIT_REFILL`
+- `RATE_LIMIT_TIME_UNIT_MS`
 
-The benchmark configuration was corrected to:
+`HOST` is handled separately as a string and validated against blank input.
 
-```text
-requestLimit = 10,000
-windowSize   = 10,000 ms
-traffic       = 1 request/ms
-iterations    = 500,000
-```
-
-Now the 10,000-slot ring buffer wraps repeatedly.
-
-With a larger 500,000-operation warm-up, an example run produced approximately:
+This phase established a useful runtime model:
 
 ```text
-Fixed Window        median ~11.42 ms
-Sliding Window Log  median ~ 7.56 ms
+OS / shell / Docker / deployment platform
+        |
+        v
+environment variables
+        |
+        v
+process.env
+        |
+        v
+application parses and validates strings
 ```
 
-This does **not** prove that Sliding Window Log is universally faster than Fixed Window.
+Environment variables arrive as strings. The application decides how to interpret them.
 
-The correct statement is:
-
-> Under this specific single-user, in-memory, warmed, advancing-time workload and configuration, the ring-buffer implementation removed the previous cleanup bottleneck and performed very well.
-
-The important result is the improvement from the original Sliding Window Log design:
-
-```text
-shift()-based cleanup       ~35–39 ms
-head-index version          ~11 ms
-ring-buffer workload        ~7–8 ms in later runs
-```
-
-Exact numbers vary because microbenchmarks are noisy, but the magnitude of the cleanup optimization was repeatedly visible.
+A `.env` file is only one possible source of those variables; it is not the environment itself.
 
 ---
 
-## 22. Benchmarking Lessons Learned
+## 21. Startup Errors and Process Exit State
 
-### 1. Do not trust a single run
-
-Runtime noise can materially change short measurements.
-
-### 2. Warm up long-running JavaScript code
-
-For a server component, steady-state performance is generally more relevant than cold-start performance.
-
-### 3. Reset state between runs
-
-Each run should receive:
-
-```text
-fresh limiter state
-+
-known fakeTime starting point
-```
-
-### 4. Keep workloads comparable
-
-Different iteration counts or traffic patterns can make algorithm comparisons meaningless.
-
-### 5. Frozen time and advancing time are different workloads
-
-Frozen time measures a same-instant path; advancing time exercises expiration/refill/bucket transitions.
-
-### 6. Benchmark implementation paths, not algorithm names
-
-“Sliding Window Log took X ms” is incomplete. The result depends on whether timestamps expired, how many users existed, the request rate, request limit, and the data structure used.
-
-### 7. Microbenchmark throughput is not service throughput
-
-The benchmark does not include:
-
-- HTTP parsing
-- sockets
-- event-loop contention from real network traffic
-- serialization
-- logging
-- Redis/network calls
-
-### 8. Measure before optimizing
-
-The biggest optimization in the project came from an implementation that was first allowed to be simple, then measured, then investigated.
-
----
-
-## 23. Current Fairness Problem: Equivalent Policies
-
-Before producing a final four-algorithm ranking, the policies must be comparable.
-
-The window algorithms are currently being considered around:
-
-```text
-10,000 requests / 10 seconds
-```
-
-That is a sustained rate of:
-
-```text
-1,000 requests / second
-```
-
-A Token Bucket configured as:
+The HTTP server listens for its own `error` event:
 
 ```ts
-tokensPerTimeUnit: 1,
-timeUnit: 1000,
+server.on("error", (error) => {
+  console.error("HTTP server error:", error);
+  process.exitCode = 1;
+});
 ```
 
-only refills **1 token per second**, so it is not an equivalent policy.
+Testing a port already in use exposed `EADDRINUSE` and reinforced the difference between:
 
-To match the sustained rate of `10,000 / 10s`, Token Bucket should refill the equivalent of:
+- logging an error
+- throwing an error
+- catching/rethrowing an error
+- setting the process exit code
+
+The project also used this phase to build a clearer model of async errors:
 
 ```text
-1,000 tokens / 1,000 ms
+async function throws
+-> returned Promise is rejected
+
+await rejected Promise
+-> behaves like a throw at the await site
+
+try/catch around await
+-> can handle that rejection
 ```
 
-with capacity chosen deliberately according to the desired burst behavior.
+---
 
-This is the immediate next benchmarking task.
+## 22. Graceful Shutdown
+
+The startup path listens for:
+
+- `SIGINT`
+- `SIGTERM`
+
+and calls `server.close()` so the server stops accepting new connections and can close cleanly.
+
+Conceptually:
+
+```text
+OS / terminal sends signal
+        |
+        v
+process signal handler runs
+        |
+        v
+server.close()
+        |
+        v
+stop accepting new connections
+        |
+        v
+finish shutdown
+```
+
+A shutdown guard exists in the current file, but the current remote implementation does not yet set that guard to `true` when shutdown begins. That should be corrected before calling the shutdown path fully idempotent.
+
+Once Redis is wired into the production startup path, graceful shutdown should also close the Redis client.
 
 ---
 
-## 24. Algorithm Trade-Off Summary
+## 23. Why Redis Was Introduced
 
-| Algorithm | Main state | Accuracy | Memory | Burst behavior | Important weakness |
-|---|---|---:|---:|---|---|
-| Fixed Window | counter + window start | coarse | very low | boundary bursts possible | unfair around aligned boundaries |
-| Sliding Window Log | accepted timestamps | exact rolling window | proportional to active accepted requests | strict rolling behavior | timestamp bookkeeping / storage |
-| Sliding Window Counter | current + previous bucket counts | approximate | very low | smoother than fixed window | approximation error |
-| Token Bucket | tokens + refill timestamp | exact to token policy | very low | naturally supports bursts | policy differs from window semantics |
+The in-memory algorithms are useful, but they have a fundamental production limitation:
 
-There is no universal winner. The correct algorithm depends on product requirements.
+```text
+Node instance A
+-> private memory
+
+Node instance B
+-> different private memory
+```
+
+If both independently rate-limit Alice, each process can allow its own quota.
+
+The distributed requirement is instead:
+
+```text
+App A ----\
+           > shared Redis -> one authoritative Alice counter
+App B ----/
+```
+
+Redis was introduced as shared state so separate application processes can coordinate on the same quota.
+
+The in-memory algorithms remain in the project. They are not being deleted or automatically rewritten in Redis. Their role is still valuable for algorithm comparison, tests, and learning. The first distributed implementation is deliberately one algorithm: Redis Fixed Window.
 
 ---
 
-## 25. Important Bugs / Mistakes and What They Taught
+## 24. Redis Server vs Redis Client
+
+A useful mental distinction became essential during this phase.
+
+### Redis server
+
+The Redis server is the actual Redis program that owns the data.
+
+In local development it currently runs in Docker and listens through the host port mapping on `127.0.0.1:6379`.
+
+### Redis client
+
+The Node `redis` package creates a client object that connects to the Redis server and sends commands.
+
+```text
+Node application
+      |
+      | Redis client connection
+      v
+Redis server
+      |
+      +--> key A
+      +--> key B
+      +--> key C
+```
+
+The client is the messenger. It does not own the shared data.
+
+This distinction leads to an important distributed-state rule:
+
+```text
+same Redis server
++
+same key
+=
+same stored state
+```
+
+Two different clients can still share state if they connect to the same Redis server and use the same key.
+
+---
+
+## 25. Docker's Role in the Redis Phase
+
+Redis is currently run locally in Docker rather than installed directly into the host OS.
+
+The development command uses a mapping like:
+
+```text
+host port 6379 -> container port 6379
+```
+
+The Node client connects to:
+
+```text
+redis://127.0.0.1:6379
+```
+
+and Docker forwards that host port to the Redis process inside the container.
+
+The important distinction is:
+
+```text
+Redis  = the database/server program
+Docker = the tool used to package/run it locally
+```
+
+Docker is infrastructure for the Redis process, not the rate-limiting algorithm itself.
+
+---
+
+## 26. Redis Fixed Window: Simplifying the State Model
+
+The in-memory Fixed Window stored:
+
+```text
+count
+windowStart
+```
+
+Redis lets the design become simpler:
+
+```text
+key   -> attempt count
+TTL   -> window lifetime
+```
+
+For Alice:
+
+```text
+rate-limit:Alice -> 3
+TTL              -> remaining window time
+```
+
+The counter represents **request attempts in the current window**, not only allowed requests.
+
+With a limit of 5:
+
+```text
+INCR -> 1 -> allow
+INCR -> 2 -> allow
+INCR -> 3 -> allow
+INCR -> 4 -> allow
+INCR -> 5 -> allow
+INCR -> 6 -> reject
+```
+
+The counter continuing above the limit is fine; the TTL deletes the whole key when the window ends.
+
+---
+
+## 27. Why `INCR` Comes Before the Limit Check
+
+A dangerous distributed design would be:
+
+```text
+GET current count
+if below limit:
+    increment
+```
+
+Two app instances could both read the same old value before either writes the new one.
+
+Redis `INCR` is atomic as a single Redis command, so the implementation increments first and then compares the returned value.
+
+That means concurrent callers receive distinct counts:
+
+```text
+caller A -> INCR -> 4
+caller B -> INCR -> 5
+caller C -> INCR -> 6
+```
+
+Only the callers whose returned count is within the configured limit are allowed.
+
+---
+
+## 28. The First Redis Correctness Problem: `INCR` + `EXPIRE`
+
+The simple implementation looked like:
+
+```ts
+const count = await client.incr(key);
+
+if (count === 1) {
+  await client.expire(key, windowSeconds);
+}
+
+return count <= requestLimit;
+```
+
+The logic is correct, but there is a failure gap:
+
+```text
+INCR succeeds
+        |
+        v
+Node process dies / connection fails
+        |
+        v
+EXPIRE never happens
+```
+
+The Redis key could then remain without a TTL.
+
+A `try/catch` does not solve this class of problem if the process dies between commands. Even when an error is catchable, the earlier Redis mutation may already have happened.
+
+This led directly to the need for a Redis-side atomic operation.
+
+---
+
+## 29. Lua for Redis-Side Atomicity
+
+The Redis Fixed Window now uses a small Lua script:
+
+```lua
+local count = redis.call("INCR", KEYS[1])
+
+if count == 1 then
+    redis.call("EXPIRE", KEYS[1], ARGV[1])
+end
+
+return count
+```
+
+Node sends the script with:
+
+```ts
+const result = await client.eval(script, {
+  keys: [key],
+  arguments: [windowSeconds.toString()],
+});
+```
+
+### Meaning of `KEYS` and `ARGV`
+
+If Node passes:
+
+```text
+key = rate-limit:Alice
+windowSeconds = 10
+```
+
+then inside Lua:
+
+```text
+KEYS[1] -> "rate-limit:Alice"
+ARGV[1] -> "10"
+```
+
+The Redis command interprets the string argument according to the command semantics.
+
+### Why Lua fixes the gap
+
+The algorithm is still logically:
+
+```text
+increment
+if first request:
+    attach expiry
+return count
+```
+
+The difference is **where the sequence executes**.
+
+Before:
+
+```text
+Node -> INCR
+Node waits
+Node -> EXPIRE
+```
+
+Now:
+
+```text
+Node -> one script
+Redis executes INCR + condition + EXPIRE atomically
+Redis -> count
+```
+
+Other Redis commands do not interleave inside the script, and Node cannot die between two separately issued Redis commands because it no longer issues them separately.
+
+This does not mean “nothing in the universe can ever fail.” Redis process failure/persistence is a separate reliability topic.
+
+---
+
+## 30. Redis Fixed Window Implementation
+
+The current distributed implementation receives the Redis client through dependency injection:
+
+```ts
+type RedisFixedWindowConfig = {
+  client: RedisClientType;
+  requestLimit: number;
+  windowSeconds: number;
+};
+```
+
+The client is created and connected outside the limiter. `isAllowed()` reuses the existing client rather than opening a new connection per request.
+
+This is intentional:
+
+```text
+application process starts
+-> create/connect client once
+-> reuse for many requests
+-> close on shutdown
+```
+
+not:
+
+```text
+every request
+-> create client
+-> connect
+-> command
+-> disconnect
+```
+
+The limiter returns:
+
+```ts
+Promise<boolean>
+```
+
+because talking to Redis is asynchronous network I/O.
+
+---
+
+## 31. Redis Integration Tests
+
+The Redis implementation is tested against a real local Redis server rather than only a mock.
+
+Current behavior tested includes:
+
+### Exact boundary
+
+With `requestLimit = 4`:
+
+```text
+requests 1-4 -> true
+request 5    -> false
+```
+
+### Independent users
+
+Blocking Alice must not block Bob because they use different Redis keys.
+
+### Window expiration
+
+A short one-second window is used in the integration test so the test does not sleep for five seconds unnecessarily.
+
+The test waits slightly longer than the TTL using Node's Promise-based timer:
+
+```ts
+import { setTimeout } from "node:timers/promises";
+
+await setTimeout(1100);
+```
+
+This pauses the current async test function without blocking the entire Node process.
+
+After Redis expires the key, the next request is allowed again.
+
+---
+
+## 32. Test Isolation: Fresh Object Is Not Fresh Redis State
+
+An important testing misconception appeared during the Redis phase.
+
+For the in-memory limiter:
+
+```ts
+new FixedWindow()
+```
+
+creates a fresh object with a fresh `Map`.
+
+For the Redis limiter:
+
+```ts
+new RedisFixedWindow(...)
+```
+
+creates a fresh JavaScript object, but the authoritative state still lives in the external Redis server.
+
+Two test cases that both use:
+
+```text
+rate-limit:Alice
+```
+
+would therefore share state even if they create separate limiter objects.
+
+The tests solve this by generating a unique prefix with `randomUUID()`:
+
+```text
+rate-limit:<uuid-a>:Alice
+rate-limit:<uuid-b>:Alice
+```
+
+This isolates each test while still using one real Redis server.
+
+Because the keys have TTLs, the temporary test data cleans itself up shortly afterward.
+
+---
+
+## 33. Redis Test Lifecycle
+
+The Redis integration test file creates one client, connects once, runs its tests, and closes the client with a test lifecycle hook:
+
+```ts
+after(async () => {
+  await client.quit();
+});
+```
+
+Putting `client.quit()` as a normal final top-level statement would not mean “wait until all asynchronous tests finish.” The test callbacks are managed by the test runner, so cleanup belongs in `after()`.
+
+This phase also reinforced module import syntax:
+
+```ts
+import test, { after } from "node:test";
+```
+
+where the default import and named import are two different module export styles. `node:test` can also be imported using named exports for both tools.
+
+---
+
+## 34. Integration Tests Introduced an External Dependency
+
+A useful failure happened after the Redis smoke file was renamed to:
+
+```text
+redis-fixed-window.test.ts
+```
+
+The npm script is:
+
+```json
+"test": "tsx --test src/*.test.ts"
+```
+
+Before the rename, the Redis file did not match `*.test.ts`, so `npm test` ignored it.
+
+After the rename, `npm test` discovered the Redis integration test and failed with:
+
+```text
+ECONNREFUSED 127.0.0.1:6379
+```
+
+when Docker/Redis was not running.
+
+The diagnosis was environmental, not an algorithm bug:
+
+```text
+Redis test discovered
+-> client tries 127.0.0.1:6379
+-> no Redis server listening
+-> connection refused
+```
+
+Current consequence:
+
+> `npm test` now requires the local Redis service to be running.
+
+A future test-infrastructure improvement is to separate fast/self-contained tests from Redis integration tests, for example with distinct npm scripts.
+
+---
+
+## 35. Current Distributed-System Question: Multiple App Instances
+
+The next proof is not “can one Redis-backed limiter work?” That is already tested.
+
+The next proof is:
+
+```text
+App A
+└── Redis client A ----\
+                       > same Redis server -> same Alice key
+App B                 /
+└── Redis client B ---/
+```
+
+The two app-side limiter objects should use separate Redis clients to more realistically simulate separate application processes.
+
+The important invariant is:
+
+```text
+same Redis server
++
+same Redis key
+=
+shared quota state
+```
+
+The planned test should alternate calls across limiter A and limiter B and prove that they consume one shared quota.
+
+After that comes a stronger concurrency test using many requests in flight at once to verify that exactly the configured number are allowed under contention.
+
+---
+
+## 36. Why Only One Redis Algorithm for Now
+
+The project still contains all four in-memory algorithms:
+
+```text
+Fixed Window
+Sliding Window Log
+Sliding Window Counter
+Token Bucket
+```
+
+The distributed phase currently implements only:
+
+```text
+Redis Fixed Window
+```
+
+This is deliberate.
+
+Rewriting every algorithm in Redis immediately would repeat infrastructure work before the important distributed concerns are proven.
+
+The current learning target is:
+
+- shared state
+- network I/O
+- Redis client lifecycle
+- atomicity
+- TTL semantics
+- multiple app instances
+- concurrency
+- failure behavior
+
+A second Redis algorithm, such as Token Bucket, may be worthwhile later if it adds a genuinely different policy trade-off. It is not required for the first credible distributed version.
+
+---
+
+## 37. Important Bugs, Misconceptions, and What They Taught
 
 ### Sliding Window Counter exact-limit bug
 
@@ -1091,245 +1404,234 @@ There is no universal winner. The correct algorithm depends on product requireme
 
 **Cause:** prospective incoming request combined with `>=` logic.
 
-**Lesson:** define whether the comparison refers to current state or state *after* accepting the request.
-
----
+**Lesson:** define whether a comparison refers to current state or state after accepting the request.
 
 ### Benchmark state reuse
 
-**Risk:** reusing the same limiter across measured runs causes later runs to benchmark different branches/state.
+**Risk:** later runs benchmark different limiter state.
 
-**Fix:** limiter factory creates fresh instances for each run.
+**Fix:** create a fresh limiter from a factory for each run.
 
 **Lesson:** benchmark setup is part of correctness.
 
----
-
 ### Fake time not reset
 
-**Risk:** later benchmark runs could start at a different point relative to window/bucket boundaries.
+**Risk:** later benchmark runs can start at different boundary positions.
 
-**Fix:** reset `fakeTime` at the start of each experiment.
+**Fix:** reset `fakeTime` per experiment.
 
-**Lesson:** equal duration does not always mean equal workload for boundary-based algorithms.
+**Lesson:** equal duration does not always mean equal workload.
 
----
+### Sliding Window Log `shift()` bottleneck
 
-### Head index initially local
+**Symptom:** expiration-heavy workloads became much slower.
 
-**Risk:** `oldestIndex` would reset to zero on every `isAllowed()` call.
+**Cause hypothesis:** hundreds of thousands of front-array removals.
 
-**Fix:** move it into persistent per-user state.
+**Fix path:** head index, then ring buffer.
 
-**Lesson:** identify which variables are local computation versus persistent algorithm state.
+**Lesson:** measurement justified the optimization.
 
----
+### Head index initially treated as local state
 
-### Reading `timestamps[0]` while incrementing `oldestIndex`
+**Risk:** it would reset on every request.
 
-**Risk:** pointer changed but the code still inspected the same array element.
-
-**Lesson:** state transitions are only meaningful if later operations actually consume the updated state.
-
----
-
-### Ring-buffer count direction
-
-When an old request expires, `count` must decrease, not increase.
-
-**Lesson:** keep a precise semantic definition for every state field. Here, `count` means **number of valid active timestamps**, not number of operations performed.
-
----
+**Lesson:** distinguish temporary computation from persistent per-user state.
 
 ### Ring-buffer wrap-around
 
-Old tests could pass without proving tail wrap-around correctness.
+**Risk:** old tests could pass without exercising circular reuse.
 
-**Fix:** add a dedicated regression test.
+**Fix:** dedicated wrap-around regression test.
 
-**Lesson:** new implementation techniques introduce new classes of bugs and deserve targeted tests.
+**Lesson:** new data structures introduce new failure modes.
 
----
+### Redis `count === 1`
 
-## 26. Why the Project Uses TypeScript Interfaces
+**Misconception:** the first-request condition looked optional once `INCR` existed.
 
-The `Limiter` interface does not create runtime behavior. It is a TypeScript contract.
+**Correction:** `count === 1` identifies a newly created window and is when the TTL must be attached.
 
-```ts
-interface Limiter {
-  isAllowed(userId: string): boolean;
-}
-```
+**Lesson:** the Redis value is the attempt counter; the TTL represents the window.
 
-It gives a meaningful name to the shared shape all algorithms provide.
+### `INCR` + `EXPIRE` in two Node commands
 
-Without it, the benchmark/server could inline the same structural type repeatedly:
+**Risk:** the process can fail after incrementing but before attaching the TTL.
 
-```ts
-{
-  isAllowed(userId: string): boolean;
-}
-```
+**Fix:** run the sequence atomically inside Redis with Lua.
 
-The interface makes the architecture explicit and lets the compiler reject incompatible implementations.
+**Lesson:** `try/catch` is not a replacement for atomic state transitions.
 
-Likewise:
+### Fresh Redis limiter object did not mean fresh state
 
-```ts
-createLimiter: () => Limiter
-```
+**Misconception:** creating `new RedisFixedWindow()` twice should isolate tests.
 
-means:
+**Correction:** state is external; same Redis server + same key means shared state.
 
-```text
-createLimiter is a function
--> takes no arguments
--> returns a limiter object
-```
+**Fix:** unique test keys.
 
-The returned limiter object then exposes `isAllowed()`, which returns the boolean decision.
+### Redis test failed after file rename
+
+**Symptom:** `npm test` suddenly failed with `ECONNREFUSED`.
+
+**Cause:** renaming the file to `*.test.ts` made the test runner discover a test that depends on Redis.
+
+**Lesson:** test discovery and environment dependencies are part of the test system.
 
 ---
 
-## 27. Current Limitations
+## 38. Current Limitations
 
-The project is still intentionally single-process and in-memory.
+The project has crossed into distributed state, but it is not production-ready yet.
 
-It does not yet solve:
+Important remaining limitations include:
 
-- multiple Node processes sharing quota state
-- atomic distributed check/update
-- process restarts losing state
-- stale client eviction across all algorithms
-- Redis/network failure behavior
-- secure client identity/authentication
-- rate-limit response headers
-- retries / `Retry-After`
-- structured logging
-- metrics and tracing
-- production load testing
-- multi-region consistency
+- Redis Fixed Window is not yet wired into `start.ts`; the running HTTP app still uses the in-memory Token Bucket
+- multi-instance shared-quota behavior has not yet been tested with separate Redis clients
+- high-concurrency/race behavior has not yet been stress-tested
+- Redis-unavailable behavior needs end-to-end verification
+- Redis client startup/reconnect/fail-fast policy is not finalized
+- Redis client is not yet part of graceful application shutdown because it is not wired into startup
+- current shutdown guard should be made truly idempotent
+- rate-limit metadata/headers are not yet exposed
+- `Retry-After` is not yet implemented
+- secure client identity/authentication is not implemented
+- structured logging is still minimal
+- metrics and tracing are not implemented
+- current `npm test` mixes self-contained tests with Redis integration tests
+- production HTTP load testing is not complete
+- multi-region consistency is intentionally out of scope for v1
 
-These are not hidden defects; they define the next phase of the project.
+These are not hidden defects. They define the next engineering phase.
 
 ---
 
-## 28. Next Technical Milestones
+## 39. Next Technical Milestones
 
-### A. Finish a fair local benchmark comparison
+### A. Prove multi-instance correctness
 
-1. configure equivalent policies
-2. benchmark all four algorithms under the same traffic timeline
-3. capture median throughput
-4. add p50/p95/p99 latency methodology
-5. measure memory
-6. run high-client-cardinality workloads
-7. test different traffic shapes:
-   - one hot user
-   - many users
-   - mostly allowed
-   - mostly rejected
-   - expiration-heavy
-   - bursty
+1. create two independent Redis clients
+2. create two `RedisFixedWindow` instances
+3. connect both clients to the same Redis server
+4. use the same randomized Alice key
+5. alternate requests across the two limiters
+6. prove one shared quota is enforced
 
-### B. Distributed rate limiting with Redis
+### B. Concurrency / race testing
 
-The next major architecture change is to move authoritative state out of a single Node process.
+1. issue many limiter decisions concurrently
+2. collect all boolean results
+3. verify exactly `requestLimit` requests are allowed
+4. repeat under contention
+5. investigate any race or failure behavior with evidence
 
-Important topics:
+### C. Wire Redis into the real application
 
-- Redis as shared state
-- atomic increments/checks
-- TTL/expiration
-- Lua scripts or equivalent atomic operations where needed
-- multi-instance correctness
-- races and concurrency
-- failure semantics when Redis is unavailable
-- clock assumptions
+1. create/connect Redis client in the startup/composition root
+2. construct `RedisFixedWindow` with that client
+3. pass it into the HTTP server through the existing `Limiter` interface
+4. define clear Redis startup failure behavior
+5. close the Redis client during graceful shutdown
 
-### C. Production hardening
+### D. Production response behavior
 
-- structured responses
 - rate-limit metadata
-- runtime configuration
-- graceful shutdown
-- metrics
-- logs
-- tracing
-- load testing
-- deployment
+- `Retry-After`
+- consistent structured errors
+- useful request IDs in logs
+
+### E. Observability
+
+- structured logs
+- decision metrics
+- allowed/rejected counters
+- dependency-error metrics
+- latency metrics
+
+### F. Real HTTP load testing
+
+Measure the service rather than only algorithm microbenchmarks:
+
+- p50/p95/p99 latency
+- throughput
+- memory
+- high-client-cardinality behavior
+- mostly-allowed traffic
+- mostly-rejected traffic
+- burst traffic
+- Redis-backed multi-instance behavior
+
+### G. Deploy two or more app instances
+
+The final distributed proof should run multiple application instances against one shared Redis service and document the architecture and failure assumptions.
 
 ---
 
 # Interview Preparation
 
-## 29. 60-Second Project Explanation
+## 40. 60-Second Project Explanation
 
-A concise explanation:
-
-> I built a TypeScript rate-limiting service from first principles and implemented Fixed Window, Sliding Window Log, Sliding Window Counter, and Token Bucket behind a shared interface. I separated the HTTP layer from the limiter through dependency injection and used injectable clocks for deterministic tests. Then I built a microbenchmark harness with V8 warm-up, repeated runs, median timing, fresh state per run, and controlled simulated time. One useful result was finding that my original Sliding Window Log used `Array.shift()` hundreds of thousands of times under an expiration-heavy workload. I replaced it first with a head index and then a bounded ring buffer, kept regression tests for wrap-around, and measured a large improvement under the same workload. The next phase is finishing an equivalent-policy comparison and then moving state to Redis to study distributed atomicity and multi-instance correctness.
+> I built a TypeScript rate-limiting service from first principles. I started with Fixed Window, then implemented Sliding Window Log, Sliding Window Counter, and Token Bucket behind a shared interface. I used injected clocks for deterministic time-based tests and built a benchmark harness with warm-up, repeated runs, fresh state, median timing, and controlled simulated time. One useful performance investigation showed that my original Sliding Window Log was doing large numbers of `Array.shift()` operations under expiration-heavy traffic, so I moved through a head-index design to a bounded ring buffer and kept regression tests for wrap-around. I then hardened a raw Node HTTP server, made the limiter interface async-compatible, added runtime configuration and shutdown handling, and moved the first distributed implementation to Redis. The Redis Fixed Window uses a Lua script so `INCR` and first-request expiry happen atomically. The current phase is proving multi-instance and concurrent correctness before wiring Redis into the deployed HTTP path.
 
 ---
 
-## 30. If Asked: “Why Did You Build Four Algorithms?”
+## 41. If Asked: “Why Four Algorithms?”
 
-A strong answer:
-
-> Because rate limiting is a trade-off problem. Fixed Window is cheap but has boundary bursts. Sliding Window Log is accurate but stores request timestamps. Sliding Window Counter reduces state by accepting approximation. Token Bucket models burst capacity and sustained refill separately. Implementing all four made the trade-offs concrete instead of treating rate limiting as one generic counter.
+> Rate limiting is a policy trade-off, not one universal counter. Fixed Window is cheap but can burst around boundaries. Sliding Window Log gives exact rolling-window behavior but stores timestamps. Sliding Window Counter reduces state by accepting approximation. Token Bucket separates burst capacity from sustained refill. Implementing all four made those trade-offs concrete.
 
 ---
 
-## 31. If Asked: “What Was the Hardest Bug?”
+## 42. If Asked: “What Was the Most Useful Performance Investigation?”
 
-Two good examples exist.
-
-### Correctness answer
-
-The Sliding Window Counter exact-limit bug:
-
-> I discovered that I was including the prospective request in the estimate and then rejecting with `>=`, which rejected the request that should have landed exactly on the configured limit. I turned it into a regression test and changed the decision to reject only when the prospective state exceeds the limit.
-
-### Performance answer
-
-The Sliding Window Log cleanup path:
-
-> The first benchmark looked fine when simulated time was frozen, but when I advanced the fake clock, timestamp expiration made Sliding Window Log about three to four times slower than Fixed Window under that workload. I used Fixed Window as a control, estimated that `shift()` was running roughly 490,000 times, then changed the data structure and reran the same tests and benchmark.
+> The Sliding Window Log initially looked fine with frozen simulated time. Once I advanced the fake clock, timestamp expiration made the cleanup path much more expensive. I estimated how often `shift()` was executing, changed the data structure, kept correctness tests, and reran the same workload. The important result was not a universal speed ranking; it was that the bottleneck hypothesis was supported by repeated measurement.
 
 ---
 
-## 32. If Asked: “Why a Ring Buffer?”
+## 43. If Asked: “Why a Ring Buffer?”
 
-> The exact sliding log needs FIFO behavior: append the newest timestamp and expire the oldest. A JavaScript array is cheap at `push()` but repeated `shift()` from the front was expensive in my measured workload. A head pointer removed the front-deletion cost but left dead entries and required compaction. The ring buffer lets me move head/tail indexes and reuse expired slots, so the valid storage is bounded by the request limit and I do not need repeated shifts or an arbitrary compaction threshold.
-
----
-
-## 33. If Asked: “Why Fake Time?”
-
-> Real wall-clock time makes time-based tests slow and nondeterministic. I inject a clock so tests and benchmarks can choose the exact timeline. In benchmarks, `fakeTime` controls what the limiter thinks the time is, while `performance.now()` measures how much real CPU time the operation takes. That lets me reproduce window transitions without sleeping.
+> The exact sliding log needs FIFO behavior. Repeated `Array.shift()` from the front was expensive in my measured expiration-heavy workload. A head pointer removed that cost but left dead entries and required compaction. The ring buffer moves head/tail indexes and reuses expired slots, so storage is bounded by the active request limit and front deletion disappears.
 
 ---
 
-## 34. If Asked: “Why Median?”
+## 44. If Asked: “Why Fake Time?”
 
-> Microbenchmarks have runtime noise from the OS, JIT, GC, CPU scheduling, and other processes. I run the same workload repeatedly and use median as a robust measure of typical execution rather than trusting one run or letting one slow spike dominate the average. I still keep the individual measurements visible instead of pretending outliers never happened.
-
----
-
-## 35. If Asked: “Why Warm Up V8?”
-
-> Node runs on V8, which uses JIT compilation and can optimize hot functions while the process is running. Measuring from the first invocation can mix cold execution, optimization work, and steady-state execution. Since a rate limiter is a long-running server component, I warm up the same code path in the same Node process before measuring steady-state behavior.
+> Real wall-clock tests are slow and nondeterministic. For the in-memory algorithms I inject a clock so tests and benchmarks control the exact timeline. In benchmarks, fake time controls what the limiter believes while `performance.now()` measures real execution time. Redis TTLs are different because Redis owns that clock, so Redis integration tests use a short real TTL instead.
 
 ---
 
-## 36. If Asked: “What Would Break in Production Today?”
+## 45. If Asked: “Why Redis?”
 
-> State is local to one process, so two server instances could each allow their own quota and violate the intended global limit. Restarting the process loses state. There is no distributed atomicity, stale-state strategy, secure client identity, or production observability yet. My next architectural milestone is Redis-backed shared state with atomic operations and multi-instance correctness tests.
+> In-memory state only works correctly inside one process. If I run two application instances, each would otherwise have its own quota state. Redis gives the instances a shared authoritative counter so the same client key is coordinated across processes.
 
 ---
 
-## 37. What This Project Demonstrates
+## 46. If Asked: “Why Lua Instead of Just `INCR` Then `EXPIRE`?”
 
-The strongest part of this project is not simply that four algorithms exist.
+> `INCR` and `EXPIRE` are individually valid Redis commands, but issuing them separately from Node creates a failure gap. If the process dies after `INCR` but before `EXPIRE`, the key can remain without a TTL. The Lua script moves the increment, first-request check, and expiry into one atomic Redis-side operation and returns the resulting count to Node.
+
+---
+
+## 47. If Asked: “Why Increment Before Checking the Limit?”
+
+> A distributed read-then-write design can race because multiple callers can read the same old count. Redis `INCR` is atomic, so each caller receives a distinct new count. The application then allows the request only if that returned count is within the configured limit.
+
+---
+
+## 48. If Asked: “What Is the Difference Between a Redis Client and Redis Server?”
+
+> The Redis server is the process that owns the data. The Node Redis client is the connection/interface that sends commands to that server. Two different clients can share state if they connect to the same Redis server and use the same key.
+
+---
+
+## 49. If Asked: “What Would Break in Production Today?”
+
+> The Redis implementation exists and is integration-tested, but the production startup path still uses the in-memory Token Bucket. I still need to prove multi-instance shared-quota behavior with separate Redis clients, run concurrency/race tests, finalize Redis failure semantics and client lifecycle, add rate-limit metadata and observability, then load-test and deploy multiple app instances against shared Redis.
+
+---
+
+## 50. What This Project Demonstrates
+
+The strongest part of the project is not the number of algorithms.
 
 The engineering story is:
 
@@ -1364,45 +1666,90 @@ preserve correctness with regression tests
 remeasure the same workload
         |
         v
-use evidence to decide what comes next
+harden the HTTP/runtime boundary
+        |
+        v
+move authoritative state to Redis
+        |
+        v
+identify a distributed failure gap
+        |
+        v
+make the Redis state transition atomic
+        |
+        v
+prove behavior with integration tests
+        |
+        v
+move next toward multi-instance + concurrency evidence
 ```
 
-That process is the main interview value of the project.
+That process is the main engineering and interview value of the repository.
 
 ---
 
-## 38. Current Status Snapshot
+## 51. Current Status Snapshot
 
-As of the current benchmarking phase:
+### Completed
 
 - [x] Fixed Window implemented and tested
 - [x] Sliding Window Log implemented and tested
 - [x] Sliding Window Counter implemented and tested
 - [x] Token Bucket implemented and tested
-- [x] HTTP service boundary
-- [x] Dependency-injected limiter interface
+- [x] deterministic injected clocks for in-memory algorithms
+- [x] raw Node HTTP service boundary
+- [x] structured HTTP responses
+- [x] request IDs
+- [x] method/path validation
+- [x] dependency-injected limiter interface
+- [x] async-compatible limiter contract
+- [x] limiter dependency failures mapped to 503
 - [x] HTTP behavior tests
-- [x] Injectable clocks
-- [x] Benchmark harness
-- [x] repeated benchmark runs
+- [x] server timeouts and client-error handling
+- [x] environment-based startup configuration
+- [x] server startup error handling
+- [x] SIGINT/SIGTERM shutdown path
+- [x] benchmark harness
 - [x] warm-up
+- [x] repeated benchmark runs
 - [x] median calculation
+- [x] fresh limiter state per benchmark run
 - [x] controlled advancing-time workload
+- [x] equivalent sustained-rate Token Bucket benchmark configuration
 - [x] Sliding Window Log bottleneck investigation
 - [x] head-index optimization experiment
 - [x] ring-buffer implementation
 - [x] ring-buffer wrap-around regression test
-- [ ] finalize equivalent policy configuration across all four algorithms
-- [ ] finish four-way benchmark comparison
-- [ ] p50/p95/p99 methodology
-- [ ] memory/high-cardinality benchmark
-- [ ] Redis distributed state
-- [ ] concurrency/race tests
-- [ ] observability and production hardening
+- [x] Redis dependency added
+- [x] local Redis running through Docker
+- [x] Redis client connectivity proven
+- [x] Redis-backed Fixed Window implementation
+- [x] Redis-side Lua atomic `INCR` + first-window `EXPIRE`
+- [x] Redis boundary integration test
+- [x] Redis per-user isolation integration test
+- [x] Redis window-expiration integration test
+- [x] Redis test key isolation with UUID prefixes
+- [x] Redis client cleanup in test lifecycle
+
+### Next
+
+- [ ] multi-instance Redis correctness with separate clients
+- [ ] concurrent request/race test
+- [ ] Redis failure-semantics tests
+- [ ] wire Redis limiter into `start.ts`
+- [ ] close Redis client during graceful shutdown
+- [ ] make shutdown guard truly idempotent
+- [ ] separate Redis integration tests from self-contained test command
+- [ ] rate-limit headers / metadata / `Retry-After`
+- [ ] structured logs and metrics
+- [ ] HTTP p50/p95/p99 load testing
+- [ ] memory/high-cardinality load testing
+- [ ] run 2+ application instances against shared Redis
+- [ ] deployment and final architecture write-up
 
 ---
 
-## 39. One Rule to Keep for the Rest of the Project
+## 52. One Rule to Keep for the Rest of the Project
 
 Do not optimize, distribute, or harden code because it sounds sophisticated.
 
@@ -1418,4 +1765,4 @@ problem
 -> conclusion
 ```
 
-That rule produced the most valuable part of the project so far and should continue into Redis, concurrency, failure handling, and production load testing.
+The next distributed milestones should follow the same rule: prove shared state, prove concurrency, prove failure behavior, then wire and load-test the real service.

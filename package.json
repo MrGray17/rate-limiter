@@ -19,6 +19,7 @@
   },
   "dependencies": {
     "esbuild": "^0.28.2",
+    "redis": "^6.2.1",
     "undici-types": "^8.3.0"
   }
 }

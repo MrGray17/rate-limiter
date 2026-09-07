@@ -62,8 +62,49 @@ test ("requests are allowed after window reset" , async () => {
 
   await setTimeout (1100);
   assert.strictEqual (await limiter.isAllowed(alice) , true)
+}) ;
+
+test ("Separate apps share same state" , async () => {
+  const clientA = createClient ({
+    url: "redis://127.0.0.1:6379"
+  })
+  const clientB = createClient ({
+    url: "redis://127.0.0.1:6379"
+  })
+
+  await clientA.connect()
+  await clientB.connect()
+  
+  const limiterA = new RedisFixedWindow({
+    client: clientA,
+    requestLimit: 4,
+    windowSeconds: 5,
+  });
+  const limiterB = new RedisFixedWindow({
+    client: clientB,
+    requestLimit: 4,
+    windowSeconds: 5,
+  });
+
+  const alice = `${randomUUID()}:Alice`
+
+  for (let i = 0 ; i<2 ; i++) {
+    const a = await limiterA.isAllowed(alice)
+    const b = await limiterB.isAllowed(alice)
+
+    assert.strictEqual(a , true)
+    assert.strictEqual(b , true)
+  }
+  assert.strictEqual (await limiterA.isAllowed(alice) , false)
+
+  after (async () => {
+    await clientA.quit() ;
+    await clientB.quit() ;
+  })
+
 })
 
 after(async () => {
   await client.quit();
 });
+

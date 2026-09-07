@@ -1,5 +1,18 @@
 import { createRateLimitServer } from "./server.js";
-import { TokenBucket } from "./token-bucket.js";
+import { RedisFixedWindow } from "./redis-fixed-window.js";
+import { createClient } from "redis";
+
+const client = createClient({
+  url: "redis://127.0.0.1:6379",
+});
+
+await client.connect();
+
+const redisLimiter = new RedisFixedWindow({
+  client,
+  requestLimit: 5,
+  windowSeconds: 10,
+});
 
 const EnvHelper = (name: string, fallback: number): number => {
   const content = process.env[name];
@@ -25,35 +38,29 @@ const HostHandler = (fallback: string): string => {
   return host.trim();
 };
 
-const limiter = new TokenBucket({
-  capacity: EnvHelper("RATE_LIMIT_CAPACITY", 10),
-  tokensPerTimeUnit: EnvHelper("RATE_LIMIT_REFILL", 1),
-  timeUnit: EnvHelper("RATE_LIMIT_TIME_UNIT_MS", 1000),
-  clock: () => Date.now(),
-});
-
-const server = createRateLimitServer(limiter);
+const server = createRateLimitServer(redisLimiter);
 const port = EnvHelper("PORT", 3000);
 const host = HostHandler("0.0.0.0");
 server.listen(port, host, () => {
   console.log(`Server running on http://${host}:${port}`);
 });
-server.on("error" , (error) => {
+server.on("error", (error) => {
   console.error("HTTP server error:", error);
   process.exitCode = 1;
-})
+});
 
-let currentlyShuttingDown = false ;
+let currentlyShuttingDown = false;
 
 const GracefulShut = () => {
   if (currentlyShuttingDown) {
-    return ;
+    return;
   }
-  console.log ("Server shutting down ...")
-  server.close(() => {
-    console.log ("Server shut")
-  })
-}
-process.on("SIGINT" , GracefulShut )
-process.on("SIGTERM" , GracefulShut)
-
+  console.log("Server shutting down ...");
+  currentlyShuttingDown = true;
+  server.close(async () => {
+    console.log("Server shut");
+    await client.quit();
+  });
+};
+process.on("SIGINT", GracefulShut);
+process.on("SIGTERM", GracefulShut);
